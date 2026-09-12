@@ -1,0 +1,1398 @@
+============================================================
+ TSB.TXT - TAPE / STICK-FOLLOW ROBLOX SCRIPT (SINGLE FILE)
+============================================================
+
+ This file contains the WHOLE script in TWO parts.
+
+ PART 1  = SERVER Script      -> paste into a Script in ServerScriptService
+ PART 2  = CLIENT LocalScript -> paste into a LocalScript in StarterPlayerScripts
+
+ WHY TWO PARTS? Roblox runs scripts in different sandboxes (server vs.
+ client). One file cannot play both roles, so the single txt below is
+ clearly separated. Copy each part into its own script object.
+
+ HOW TO SPLIT: copy everything between (and including) the two lines:
+     -- ==[ PART 1 START ]== ... -- ==[ PART 1 END ]==
+ then the SECOND block from -- ==[ PART 2 START ]== ... END.
+ There is no setup work outside of Roblox: the server spawns a wander
+ dummy automatically, so it works with a single player.
+
+ ============================================================
+==== PART 1 - SERVER SCRIPT (Script -> ServerScriptService) ====
+ ===========================================================
+
+-- ==[ PART 1 START ]==
+--[[--------------------------------------------------------------------
+	TAPE METHOD — SERVER  (Script)
+	Place in:  ServerScriptService
+
+	THE IDEA
+	--------
+	Normal chase = repeatedly move toward Target's current world position.
+	Tape        = Target becomes the reference coordinate system. The
+	              follower's position is computed every step as:
+
+	                  desiredCFrame = Target.CFrame * CFrame.new(side, height, dist)
+
+	              Because the offset lives in Target's LOCAL space, any
+	              movement AND rotation of the Target carries the follower
+	              with it — the follower is "taped" to the Target.
+
+	This server script handles:
+	  • a live census of every character (players AND NPCs/dummies that
+	    have a Humanoid + HumanoidRootPart),
+	  • per-player selection of FOLLOWER (the "Player") and TARGET,
+	  • the sticky CFrame follow, with a fast glide-in when the target
+	    jumps far away (so it never looks like a single hard teleport),
+	  • world markers: rings, tape beam, tape-spot ghost, prediction dot,
+	  • a procedural "wandering dummy" so the whole thing can be tested
+	    with NO other player in the game.
+--------------------------------------------------------------------]]
+
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local Workspace = game:GetService("Workspace")
+local CollectionService = game:GetService("CollectionService")
+
+-- Tunables -------------------------------------------------------------
+local DEFAULT_SIDE = 0            -- X offset in target local space
+local DEFAULT_HEIGHT = 0          -- Y offset in target local space
+local DEFAULT_DIST = 5            -- Z offset in target local space
+local DEFAULT_PRED_TIME = 1       -- seconds ahead for prediction
+local GLIDE_DIST = 2.5            -- if farther than this, glide in instead of hard-locking
+
+-- Remote ----------------------------------------------------------------
+local TapeRemote = ReplicatedStorage:FindFirstChild("TapeRemote")
+if not TapeRemote then
+	TapeRemote = Instance.new("RemoteEvent")
+	TapeRemote.Name = "TapeRemote"
+	TapeRemote.Parent = ReplicatedStorage
+end
+
+-- ======================================================================
+--  CHARACTER CENSUS
+--  Everything that has a Humanoid + HumanoidRootPart becomes a selectable
+--  character: players and NPCs/dummies alike.
+-- ======================================================================
+local humanoidToUid = {}   -- humanoid instance -> uid (stable across spawns/destroy)
+local chars = {}           -- uid -> {model, root, humanoid, name, isPlayer, player}
+local nextUid = 1
+
+local function findRoot(model)
+	if not model then return nil end
+	return model:FindFirstChild("HumanoidRootPart") or model.PrimaryPart
+end
+
+local function register(model, name, isPlayer, player)
+	if not model or not model.Parent then return end
+	local humanoid = model:FindFirstChildOfClass("Humanoid")
+	local root = findRoot(model)
+	if not humanoid or not root then return end
+	local uid = humanoidToUid[humanoid]
+	if not uid then
+		uid = nextUid
+		nextUid = nextUid + 1
+		humanoidToUid[humanoid] = uid
+	end
+	chars[uid] = {
+		model = model,
+		root = root,
+		humanoid = humanoid,
+		name = name,
+		isPlayer = isPlayer,
+		player = player,
+	}
+end
+
+local function rescan()
+	for uid in pairs(chars) do chars[uid] = nil end
+
+	for _, plr in ipairs(Players:GetPlayers()) do
+		local c = plr.Character
+		if c and c.Parent then
+			register(c, plr.DisplayName, true, plr)
+		end
+	end
+
+	for _, desc in ipairs(Workspace:GetDescendants()) do
+		if desc:IsA("Model") and desc.Parent then
+			local hum = desc:FindFirstChildOfClass("Humanoid")
+			local root = findRoot(desc)
+			if hum and root and not Players:GetPlayerFromCharacter(desc) then
+				register(desc, desc.Name, false, nil)
+			end
+		end
+	end
+end
+
+-- ======================================================================
+--  VELOCITY SAMPLING (for the prediction visual)
+-- ======================================================================
+local vels = {}        -- uid -> Vector3 (measured)
+local lastSample = {}  -- uid -> {pos, time}
+
+local function sampleVelocities()
+	local now = os.clock()
+	for uid, c in pairs(chars) do
+		local root = c.root
+		if root and root.Parent then
+			local pos = root.Position
+			local s = lastSample[uid]
+			if s and (now - s.time) >= 0.08 then
+				vels[uid] = (pos - s.pos) / (now - s.time)
+				s.pos = pos
+				s.time = now
+			elseif not s then
+				lastSample[uid] = { pos = pos, time = now }
+				if not vels[uid] then vels[uid] = Vector3.zero end
+			end
+		end
+	end
+end
+
+-- ======================================================================
+--  PER-PLAYER STATE
+-- ======================================================================
+local state = {}
+
+local function st(plr)
+	local s = state[plr]
+	if not s then
+		s = {
+			followerUid = nil,
+			targetUid = nil,
+			tapeOn = false,
+			predOn = true,
+			side = DEFAULT_SIDE,
+			height = DEFAULT_HEIGHT,
+			dist = DEFAULT_DIST,
+			predTime = DEFAULT_PRED_TIME,
+		}
+		state[plr] = s
+	end
+	return s
+end
+
+-- ======================================================================
+--  WORLD MARKERS / FX
+-- ======================================================================
+local fx = {} -- player -> marker handles
+
+local function uicorner(inst, r)
+	local c = Instance.new("UICorner")
+	c.CornerRadius = UDim.new(0, r)
+	c.Parent = inst
+end
+
+local function ensureAttach(root, name)
+	local a = root:FindFirstChild(name)
+	if not a then
+		a = Instance.new("Attachment")
+		a.Name = name
+		a.Parent = root
+	end
+	return a
+end
+
+local function safeDestroy(x)
+	if x and x.Parent then x:Destroy() end
+end
+
+-- Floating ring + label above a character's head
+local function ensureRing(player, role, root, colorRGB, charName)
+	local f = fx[player]
+	local key = role .. "Ring"
+
+	if f and f[key] and f[key].Parent and f[key .. "Root"] == root then
+		return f[key]
+	end
+
+	if f then safeDestroy(f[key]) end
+	if not f then f = {}; fx[player] = f end
+
+	local gui = Instance.new("BillboardGui")
+	gui.Name = "TapeRing_" .. player.UserId .. "_" .. role
+	gui.Size = UDim2.fromOffset(160, 66)
+	gui.AlwaysOnTop = true
+	gui.MaxDistance = 800
+	gui.LightInfluence = 0
+	gui.Adornee = root
+	gui.StudsOffsetWorldSpace = Vector3.new(0, 3.2, 0)
+
+	local ring = Instance.new("Frame")
+	ring.Size = UDim2.fromOffset(42, 42)
+	ring.AnchorPoint = Vector2.new(0.5, 0)
+	ring.Position = UDim2.fromScale(0.5, 0)
+	ring.BackgroundColor3 = colorRGB
+	ring.BackgroundTransparency = 0.25
+	ring.BorderSizePixel = 0
+	uicorner(ring, 21)
+
+	local stroke = Instance.new("UIStroke")
+	stroke.Color = Color3.new(1, 1, 1)
+	stroke.Thickness = 2
+	stroke.Parent = ring
+
+	local label = Instance.new("TextLabel")
+	label.Size = UDim2.new(1, 0, 0, 20)
+	label.AnchorPoint = Vector2.new(0.5, 1)
+	label.Position = UDim2.fromScale(0.5, 1)
+	label.BackgroundTransparency = 1
+	label.BorderSizePixel = 0
+	label.Text = (role == "target" and "TARGET" or "PLAYER") .. "  " .. tostring(charName)
+	label.TextColor3 = colorRGB
+	label.TextScaled = true
+	label.Font = Enum.Font.GothamBold
+	label.TextStrokeTransparency = 0.4
+	label.Parent = gui
+
+	ring.Parent = gui
+	gui.Parent = root
+
+	f[key] = gui
+	f[key .. "Root"] = root
+	return gui
+end
+
+-- The white "tape" ribbon between follower and target
+local function ensureTapeBeam(player, rootA, rootB)
+	local f = fx[player]
+	if not f then f = {}; fx[player] = f end
+
+	local beam = f.tapeBeam
+	if not beam or not beam.Parent then
+		beam = Instance.new("Beam")
+		beam.Name = "TapeBeam_" .. player.UserId
+		beam.Color = ColorSequence.new(Color3.fromRGB(230, 234, 244))
+		beam.Transparency = NumberSequence.new(0.12)
+		beam.Width0 = 0.35
+		beam.Width1 = 0.35
+		beam.LightEmission = 0.25
+		beam.LightInfluence = 0
+		beam.Parent = Workspace
+		f.tapeBeam = beam
+	end
+
+	local a0 = ensureAttach(rootA, "TapeAttach")
+	local a1 = ensureAttach(rootB, "TapeAttach")
+	if beam.Attachment0 ~= a0 then beam.Attachment0 = a0 end
+	if beam.Attachment1 ~= a1 then beam.Attachment1 = a1 end
+	return beam
+end
+
+-- Translucent disc showing where the tape WOULD place the follower.
+local function ensureGhost(player)
+	local f = fx[player]
+	if not f then f = {}; fx[player] = f end
+
+	local part = f.ghostPart
+	if not part or not part.Parent then
+		if part then safeDestroy(part) end
+		part = Instance.new("Part")
+		part.Name = "TapeGhost_" .. player.UserId
+		part.Anchored = true
+		part.CanCollide = false
+		part.CanQuery = false
+		part.CanTouch = false
+		part.CastShadow = false
+		part.Shape = Enum.PartType.Cylinder
+		part.Color = Color3.fromRGB(34, 211, 238)
+		part.Material = Enum.Material.Glass
+		part.Transparency = 0.55
+		part.Size = Vector3.new(1.8, 1.4, 1.8)
+		part.Parent = Workspace
+		f.ghostPart = part
+	end
+	return part
+end
+
+-- Orange dot (with small tether beam) showing predicted future position.
+local function ensurePredMarker(player, targetRoot)
+	local f = fx[player]
+	if not f then f = {}; fx[player] = f end
+
+	local part = f.predPart
+	if not part or not part.Parent then
+		if part then safeDestroy(part) end
+		part = Instance.new("Part")
+		part.Name = "TapePrediction_" .. player.UserId
+		part.Anchored = true
+		part.CanCollide = false
+		part.CanQuery = false
+		part.CanTouch = false
+		part.CastShadow = false
+		part.Shape = Enum.PartType.Ball
+		part.Material = Enum.Material.Neon
+		part.Color = Color3.fromRGB(251, 146, 60)
+		part.Transparency = 0.3
+		part.Size = Vector3.new(1.4, 1.4, 1.4)
+		part.Parent = Workspace
+		f.predPart = part
+
+		local bg = Instance.new("BillboardGui")
+		bg.Size = UDim2.fromOffset(180, 24)
+		bg.AlwaysOnTop = true
+		bg.MaxDistance = 800
+		bg.LightInfluence = 0
+		bg.Adornee = part
+		bg.StudsOffsetWorldSpace = Vector3.new(0, 1.2, 0)
+		local lbl = Instance.new("TextLabel")
+		lbl.Size = UDim2.fromScale(1, 1)
+		lbl.BackgroundTransparency = 1
+		lbl.Text = "PREDICTED"
+		lbl.TextColor3 = Color3.fromRGB(255, 190, 110)
+		lbl.TextScaled = true
+		lbl.Font = Enum.Font.GothamBold
+		lbl.Parent = bg
+		bg.Parent = part
+
+		local beam = Instance.new("Beam")
+		beam.Name = "TapePredBeam_" .. player.UserId
+		beam.Color = ColorSequence.new(Color3.fromRGB(251, 146, 60))
+		beam.Transparency = NumberSequence.new(0.45)
+		beam.Width0 = 0.1
+		beam.Width1 = 0.1
+		beam.FaceCamera = false
+		beam.LightEmission = 0.3
+		beam.LightInfluence = 0
+		beam.Parent = Workspace
+		f.predBeam = beam
+	end
+
+	local a0 = ensureAttach(targetRoot, "TapeAttach")
+	local a1 = ensureAttach(part, "PredAttach")
+	f.predBeam.Attachment0 = a0
+	f.predBeam.Attachment1 = a1
+	return part
+end
+
+local function cleanupFx(plr)
+	local f = fx[plr]
+	if not f then return end
+	safeDestroy(f.targetRing)
+	safeDestroy(f.followerRing)
+	safeDestroy(f.tapeBeam)
+	safeDestroy(f.predPart)
+	safeDestroy(f.predBeam)
+	safeDestroy(f.ghostPart)
+	fx[plr] = nil
+end
+
+-- ======================================================================
+--  BROADCAST HELPERS
+-- ======================================================================
+local function sendList(plr)
+	local entries = {}
+	for uid, c in pairs(chars) do
+		table.insert(entries, { uid = uid, name = c.name, isPlayer = c.isPlayer })
+	end
+	table.sort(entries, function(a, b) return a.name < b.name end)
+	TapeRemote:FireClient(plr, "list", entries)
+end
+
+local function sendStatus(plr)
+	local s = st(plr)
+	TapeRemote:FireClient(plr, "status", {
+		followerUid = s.followerUid,
+		targetUid = s.targetUid,
+		tapeOn = s.tapeOn,
+		predOn = s.predOn,
+		side = s.side,
+		height = s.height,
+		dist = s.dist,
+		predTime = s.predTime,
+	})
+end
+
+-- ======================================================================
+--  PROCEDURAL WANDERING DUMMY (R6) — so you can test with zero players
+-- ======================================================================
+local dummyCount = 0
+
+local function spawnDummy()
+	dummyCount = dummyCount + 1
+
+	local model = Instance.new("Model")
+	model.Name = "TapeDummy" .. tostring(dummyCount)
+
+	local function part(name_, size, color)
+		local p = Instance.new("Part")
+		p.Name = name_
+		p.Size = size
+		p.Color = color
+		p.Material = Enum.Material.SmoothPlastic
+		p.Anchored = false
+		p.CanCollide = true
+		p.TopSurface = Enum.SurfaceType.Smooth
+		p.BottomSurface = Enum.SurfaceType.Smooth
+		p.Parent = model
+		return p
+	end
+
+	local root = part("HumanoidRootPart", Vector3.new(2, 2, 1), Color3.fromRGB(51, 65, 85))
+	local torso = part("Torso", Vector3.new(2, 2, 1), Color3.fromRGB(51, 65, 85))
+	local head = part("Head", Vector3.new(1.2, 1.2, 1.2), Color3.fromRGB(226, 232, 240))
+	local larm = part("Left Arm", Vector3.new(1, 2, 1), Color3.fromRGB(71, 85, 105))
+	local rarm = part("Right Arm", Vector3.new(1, 2, 1), Color3.fromRGB(71, 85, 105))
+	local lleg = part("Left Leg", Vector3.new(1, 2, 1), Color3.fromRGB(41, 52, 70))
+	local rleg = part("Right Leg", Vector3.new(1, 2, 1), Color3.fromRGB(41, 52, 70))
+
+	local hum = Instance.new("Humanoid")
+	hum.Name = "Humanoid"
+	hum.MaxHealth = 100
+	hum.WalkSpeed = 11
+	hum.BreakJointsOnDeath = false
+	hum.DisplayDistanceType = Enum.HumanoidDisplayDistanceType.None
+	hum.Parent = model
+
+	model.PrimaryPart = root
+	model.Parent = Workspace
+
+	local function motor(part0, part1, c0)
+		local m = Instance.new("Motor6D")
+		m.Part0 = part0
+		m.Part1 = part1
+		m.C0 = c0
+		m.C1 = CFrame.new()
+		m.Parent = part0
+	end
+
+	motor(root, torso, CFrame.new(0, 0, 0, -1, 0, 0, 0, 0, 1, 0, 1, -0))
+	motor(torso, head, CFrame.new(0, 1, 0, -1, 0, 0, 0, 0, 1, 0, 1, -0))
+	motor(torso, rarm, CFrame.new(1.5, 0.5, 0, 0, 0, 1, -0, 1, 0, -1, 0, -0))
+	motor(torso, larm, CFrame.new(-1.5, 0.5, 0, 0, 0, -1, -0, 1, 0, 1, 0, 0))
+	motor(torso, rleg, CFrame.new(1, -1, 0, 0, 0, 1, 0, 1, 0, -1, 0, 0))
+	motor(torso, lleg, CFrame.new(-1, -1, 0, 0, 0, -1, 0, 1, 0, 1, 0, 0))
+
+	model:PivotTo(CFrame.new(math.random(-15, 15), 4, math.random(25, 35)))
+
+	-- Wanders in slow arcs so you can watch the tape follow rotation/position.
+	task.spawn(function()
+		local angle = math.random() * math.pi * 2
+		while model.Parent and hum.Parent do
+			if root.Parent then
+				angle = angle + math.rad(math.random(20, 50)) * (math.random() < 0.5 and 1 or -1)
+				local center = root.Position
+				local radius = math.random(6, 15)
+				local nextPos = center + Vector3.new(math.cos(angle) * radius, 0, math.sin(angle) * radius)
+				hum:MoveTo(nextPos)
+				hum.MoveToFinished:Wait(math.random(2, 5))
+				task.wait(0.6)
+			else
+				task.wait(1)
+			end
+		end
+	end)
+
+	CollectionService:AddTag(model, "TapeDummy")
+	return model
+end
+
+-- ======================================================================
+--  HEARTBEAT — THE ACTUAL "TAPE" LOGIC
+-- ======================================================================
+RunService.Heartbeat:Connect(function()
+	sampleVelocities()
+
+	for plr, s in pairs(state) do
+		if plr.Parent then
+			local fb = s.followerUid and chars[s.followerUid]
+			local tg = s.targetUid and chars[s.targetUid]
+
+			if fb and tg and fb.root and fb.root.Parent and tg.root and tg.root.Parent then
+				local fRoot = fb.root
+				local tRoot = tg.root
+
+				-- Markers: rings + the white "tape" ribbon.
+				ensureRing(plr, "target", tRoot, Color3.fromRGB(239, 68, 68), tg.name)
+				ensureRing(plr, "follower", fRoot, Color3.fromRGB(59, 130, 246), fb.name)
+				ensureTapeBeam(plr, fRoot, tRoot)
+
+				-- The core formula of the Tape Method:
+				--   desiredCFrame = Target.CFrame * CFrame.new(side, height, dist)
+				local tCf = tRoot.CFrame
+				local desired = tCf * CFrame.new(s.side, s.height, s.dist)
+				local tVel = vels[s.targetUid] or Vector3.zero
+
+				-- Ghost = where the tape would put us (visible even when STICK is off).
+				local ghost = ensureGhost(plr)
+				local gpos = desired.Position
+				ghost.CFrame = CFrame.lookAt(gpos, gpos + tCf.LookVector, Vector3.new(0, 1, 0))
+
+				-- STICK mode: physically lock the follower onto desired.
+				if s.tapeOn then
+					if not s._glued or (fRoot.Position - gpos).Magnitude > GLIDE_DIST then
+						-- fast glide-in when far, so it never looks like a hard teleport
+						local alpha = math.clamp(0.14 + ((fRoot.Position - gpos).Magnitude / 40), 0.05, 1)
+						fRoot.CFrame = fRoot.CFrame:Lerp(desired, alpha)
+						if (fRoot.Position - gpos).Magnitude < 0.6 then
+							s._glued = true
+						end
+					else
+						-- once glued: every move AND every rotation of the target drags us along
+						fRoot.CFrame = desired
+					end
+					fRoot.AssemblyLinearVelocity = Vector3.zero
+					fb.humanoid.PlatformStand = true
+				else
+					s._glued = false
+					fb.humanoid.PlatformStand = false
+				end
+
+				-- PREDICTION: where the target WILL be, using measured velocity.
+				-- Pure visual — never touches any real character.
+				local f = fx[plr]
+				if s.predOn then
+					local predPos = tRoot.Position + tVel * s.predTime
+					local predPart = ensurePredMarker(plr, tRoot)
+					if tVel.Magnitude > 0.1 then
+						predPart.CFrame = CFrame.lookAt(tRoot.Position + Vector3.new(0, 0.5, 0), predPos + Vector3.new(0, 0.5, 0), Vector3.new(0, 1, 0))
+					else
+						predPart.CFrame = CFrame.new(predPos)
+					end
+				elseif f then
+					safeDestroy(f.predPart)
+					safeDestroy(f.predBeam)
+					f.predPart = nil
+					f.predBeam = nil
+				end
+			else
+				if fb then fb.humanoid.PlatformStand = false end
+				cleanupFx(plr)
+			end
+		end
+	end
+end)
+
+-- ======================================================================
+--  REMOTE HANDLING + HOUSEKEEPING
+-- ======================================================================
+local function ensureDefaults(plr, s)
+	if not s.followerUid then
+		for uid, c in pairs(chars) do
+			if c.isPlayer and c.player == plr then s.followerUid = uid break end
+		end
+	end
+	if not s.targetUid then
+		local targetUid = nil
+		for uid, c in pairs(chars) do
+			if uid ~= s.followerUid and c.isPlayer then targetUid = uid break end
+		end
+		if not targetUid then
+			for uid, c in pairs(chars) do
+				if uid ~= s.followerUid then targetUid = uid break end
+			end
+		end
+		if not targetUid then -- nobody to follow: spawn a wandering dummy
+			local dummy = spawnDummy()
+			rescan()
+			for uid, c in pairs(chars) do
+				if c.model == dummy then targetUid = uid break end
+			end
+		end
+		s.targetUid = targetUid
+	end
+end
+
+TapeRemote.OnServerEvent:Connect(function(plr, action, a, b)
+	if not plr or not plr.Parent then return end
+	local s = st(plr)
+
+	if action == "init" then
+		rescan()
+		ensureDefaults(plr, s)
+		sendList(plr)
+		sendStatus(plr)
+
+	elseif action == "select" then
+		local role = a
+		local uid = b
+		if role == "follower" then
+			if uid == s.targetUid then sendStatus(plr) return end
+			s.followerUid = uid
+		elseif role == "target" then
+			if uid == s.followerUid then sendStatus(plr) return end
+			s.targetUid = uid
+		end
+		sendStatus(plr)
+
+	elseif action == "mode" then
+		if a == "tape" then s.tapeOn = not not b
+		elseif a == "pred" then s.predOn = not not b end
+		sendStatus(plr)
+
+	elseif action == "param" then
+		if a == "side" then s.side = b
+		elseif a == "height" then s.height = b
+		elseif a == "dist" then s.dist = b
+		elseif a == "predTime" then s.predTime = b end
+
+	elseif action == "spawnDummy" then
+		local dummy = spawnDummy()
+		task.wait(0.05)
+		rescan()
+		if not s.targetUid then
+			for uid, c in pairs(chars) do
+				if c.model == dummy then s.targetUid = uid break end
+			end
+		end
+		sendList(plr)
+		sendStatus(plr)
+	end
+end)
+
+-- keep census fresh when players spawn / leave
+local function refreshAll()
+	rescan()
+	for plr, s in pairs(state) do
+		if plr.Parent then
+			ensureDefaults(plr, s)
+			sendList(plr)
+			sendStatus(plr)
+		end
+	end
+end
+
+Players.PlayerAdded:Connect(function()
+	task.wait(2)
+	refreshAll()
+end)
+Players.PlayerRemoving:Connect(function(plr)
+	state[plr] = nil
+	cleanupFx(plr)
+end)
+for _, plr in ipairs(Players:GetPlayers()) do
+	plr.CharacterAdded:Connect(function()
+		task.wait(1)
+		refreshAll()
+	end)
+end
+
+-- periodic broadcast keeps the lists honest (NPCs spawn/appear/rename)
+task.spawn(function()
+	while true do
+		task.wait(2)
+		refreshAll()
+	end
+end)
+-- ==[ PART 1 END ]==
+
+============================================================
+==== PART 2 - CLIENT LocalScript (StarterPlayerScripts) ====
+============================================================
+
+-- ==[ PART 2 START ]==
+--[[--------------------------------------------------------------------
+	TAPE METHOD — CLIENT  (LocalScript)
+	Place in:  StarterPlayerScripts
+
+	Builds the vertical, dark, developer-style panel:
+	  • draggable header
+	  • collapse (- / +) and close (x) with reopen pill
+	  • STICK + PREDICT toggles
+	  • explanation of the Tape Method (collapsible)
+	  • PLAYER (follower) and TARGET lists (players AND NPCs/dummies)
+	  • side / height / distance / prediction-time sliders
+	  • connection status readout
+
+	All movement, markers and prediction happen on the server; this
+	script is only the control surface.
+--------------------------------------------------------------------]]
+
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local UserInputService = game:GetService("UserInputService")
+local TweenService = game:GetService("TweenService")
+
+local player = Players.LocalPlayer
+local playerGui = player:WaitForChild("PlayerGui")
+local TapeRemote = ReplicatedStorage:WaitForChild("TapeRemote", 10)
+
+if not TapeRemote then
+	error("TapeMethod: could not find TapeRemote - is the Server script running?")
+end
+
+-- ============================================================
+--  THEME  (OLED dark, developer console)
+-- ============================================================
+local FONT = {
+	heading = Enum.Font.GothamBold,
+	body = Enum.Font.Gotham,
+	mono = Enum.Font.RobotoMono,
+}
+
+local PAL = {
+	bg = Color3.fromRGB(11, 16, 27),          -- page bg
+	panel = Color3.fromRGB(27, 35, 54),       -- panel bg
+	panelSoft = Color3.fromRGB(39, 47, 66),   -- cards / inactive toggles
+	card = Color3.fromRGB(34, 43, 64),        -- list wells
+	border = Color3.fromRGB(71, 85, 105),
+	text = Color3.fromRGB(248, 250, 252),
+	dim = Color3.fromRGB(148, 163, 184),
+	faint = Color3.fromRGB(100, 116, 139),
+	accent = Color3.fromRGB(34, 197, 94),     -- run-green
+	accentDark = Color3.fromRGB(15, 23, 42),
+	blue = Color3.fromRGB(59, 130, 246),
+	red = Color3.fromRGB(239, 68, 68),
+	orange = Color3.fromRGB(251, 146, 60),
+}
+
+local PANEL_W = 260
+local PANEL_H = 648
+local HDR_H = 34
+
+-- ============================================================
+--  SMALL BUILDER HELPERS
+-- ============================================================
+local function mk(parent, class, props)
+	local inst = Instance.new(class)
+	for k, v in pairs(props or {}) do
+		inst[k] = v
+	end
+	inst.Parent = parent
+	return inst
+end
+
+local function uic(inst, r)
+	return mk(inst, "UICorner", { CornerRadius = UDim.new(0, r) })
+end
+
+-- ============================================================
+--  SCREEN + PANEL
+-- ============================================================
+local screenGui = mk(playerGui, "ScreenGui", {
+	Name = "TapeMethodGui",
+	ResetOnSpawn = false,
+	IgnoreGuiInset = true,
+	DisplayOrder = 20,
+	ZIndexBehavior = Enum.ZIndexBehavior.Sibling,
+})
+
+local panel = mk(screenGui, "Frame", {
+	Name = "Panel",
+	Size = UDim2.fromOffset(PANEL_W, PANEL_H),
+	Position = UDim2.new(1, -PANEL_W - 18, 1, -PANEL_H - 18),
+	BackgroundColor3 = PAL.panel,
+	BorderSizePixel = 0,
+	ClipsDescendants = true,
+	ZIndex = 4,
+})
+mk(panel, "UIStroke", { Color = PAL.border, Thickness = 1 })
+uic(panel, 10)
+
+-- --- header (drag handle) ------------------------------------
+local header = mk(panel, "Frame", {
+	Name = "Header",
+	Size = UDim2.fromOffset(PANEL_W, HDR_H),
+	BackgroundColor3 = PAL.bg,
+	BorderSizePixel = 0,
+})
+uic(header, 10)
+
+mk(header, "TextLabel", {
+	Name = "Title",
+	Size = UDim2.new(1, -74, 0, HDR_H),
+	Position = UDim2.fromOffset(10, 0),
+	BackgroundTransparency = 1,
+	Text = "TAPE METHOD",
+	TextColor3 = PAL.text,
+	Font = FONT.heading,
+	TextSize = 13,
+	TextXAlignment = Enum.TextXAlignment.Left,
+})
+
+local collapseBtn = mk(header, "TextButton", {
+	Size = UDim2.fromOffset(30, HDR_H),
+	Position = UDim2.new(1, -63, 0, 0),
+	BackgroundTransparency = 1,
+	Text = "-",
+	TextColor3 = PAL.dim,
+	Font = FONT.heading,
+	TextSize = 16,
+	ZIndex = 6,
+})
+
+local closeBtn = mk(header, "TextButton", {
+	Size = UDim2.fromOffset(30, HDR_H),
+	Position = UDim2.new(1, -32, 0, 0),
+	BackgroundTransparency = 1,
+	Text = "x",
+	TextColor3 = PAL.faint,
+	Font = FONT.heading,
+	TextSize = 13,
+	ZIndex = 6,
+})
+
+-- --- scrollable body -----------------------------------------
+local cursorY = 8
+
+local body = mk(panel, "ScrollingFrame", {
+	Name = "Body",
+	Size = UDim2.new(1, 0, 1, -HDR_H),
+	Position = UDim2.fromOffset(0, HDR_H),
+	BackgroundTransparency = 1,
+	BorderSizePixel = 0,
+	ScrollBarThickness = 6,
+	ScrollBarImageColor3 = PAL.border,
+	CanvasSize = UDim2.fromOffset(0, 800),
+	VerticalScrollBarPosition = Enum.VerticalScrollBarPosition.Right,
+})
+
+local function place(h, gap)
+	local y = cursorY
+	cursorY = cursorY + h + (gap or 6)
+	return y
+end
+
+-- ============================================================
+--  SECTION 1 — MODE TOGGLES
+-- ============================================================
+local stickToggle = nil
+local predToggle = nil
+
+local function makeToggle(x, key, offText, onText)
+	local btn = mk(body, "TextButton", {
+		Name = key .. "Btn",
+		Size = UDim2.new(0, 119, 0, 30),
+		Position = UDim2.new(0, x, 0, place(30, 8)),
+		BackgroundColor3 = PAL.panelSoft,
+		BorderSizePixel = 0,
+		AutoButtonColor = false,
+		Text = offText,
+		TextColor3 = PAL.text,
+		Font = FONT.heading,
+		TextSize = 12,
+		ZIndex = 2,
+	})
+	uic(btn, 7)
+	local stroke = mk(btn, "UIStroke", { Color = PAL.border, Thickness = 1, Transparency = 0.5 })
+	local active = false
+
+	local function refresh()
+		if active then
+			btn.BackgroundColor3 = PAL.accent
+			btn.TextColor3 = PAL.accentDark
+			btn.Text = onText
+			stroke.Color = PAL.accent
+			stroke.Transparency = 0
+		else
+			btn.BackgroundColor3 = PAL.panelSoft
+			btn.TextColor3 = PAL.text
+			btn.Text = offText
+			stroke.Color = PAL.border
+			stroke.Transparency = 0.5
+		end
+	end
+
+	local self = { setActive = function(v) active = v; refresh() end }
+	btn.Activated:Connect(function()
+		active = not active
+		refresh()
+		TapeRemote:FireServer("mode", key == "stick" and "tape" or "pred", active)
+	end)
+	refresh()
+	return self
+end
+
+stickToggle = makeToggle(8, "stick", "STICK  OFF", "STICK  ON")
+predToggle = makeToggle(133, "pred", "PREDICT  OFF", "PREDICT  ON")
+
+-- ============================================================
+--  SECTION 2 — EXPLANATION (collapsible)
+-- ============================================================
+local explOpen = true
+
+local explHeader = mk(body, "TextButton", {
+	Size = UDim2.new(1, -16, 0, 24),
+	Position = UDim2.new(0, 8, 0, place(24, 4)),
+	BackgroundTransparency = 1,
+	Text = "-  HOW THE TAPE WORKS",
+	TextColor3 = PAL.dim,
+	TextSize = 11,
+	Font = FONT.heading,
+	TextXAlignment = Enum.TextXAlignment.Left,
+	ZIndex = 2,
+})
+
+local explBody = mk(body, "TextLabel", {
+	Size = UDim2.new(1, -16, 0, 124),
+	Position = UDim2.new(0, 8, 0, place(124, 4)),
+	BackgroundColor3 = PAL.card,
+	BorderSizePixel = 0,
+	Text = "NORMAL CHASE = repeatedly move toward the Target's CURRENT WORLD position\n\nTAPE = the Target becomes the REFERENCE COORDINATE SYSTEM. Our position is redefined relative to the Target, so movement AND rotation carry the relationship with it.\n\nWhen the Target turns, the tape spot orbits it. When it backs up, we back up with it. That is sticking - not chasing.",
+	TextColor3 = PAL.text,
+	TextSize = 12,
+	Font = FONT.body,
+	TextWrapped = true,
+	TextXAlignment = Enum.TextXAlignment.Left,
+	TextYAlignment = Enum.TextYAlignment.Top,
+})
+uic(explBody, 6)
+
+local formulaLbl = mk(body, "TextLabel", {
+	Size = UDim2.new(1, -16, 0, 18),
+	Position = UDim2.new(0, 8, 0, place(18, 8)),
+	BackgroundColor3 = PAL.accentDark,
+	BorderSizePixel = 0,
+	Text = "desiredCFrame = Target.CFrame * CFrame.new(0, 0, 5)",
+	TextColor3 = PAL.accent,
+	TextSize = 11,
+	Font = FONT.mono,
+	TextXAlignment = Enum.TextXAlignment.Left,
+})
+uic(formulaLbl, 4)
+
+explHeader.Activated:Connect(function()
+	explOpen = not explOpen
+	explBody.Visible = explOpen
+	formulaLbl.Visible = explOpen
+	explHeader.Text = (explOpen and "-" or "+") .. "  HOW THE TAPE WORKS"
+end)
+
+-- ============================================================
+--  SECTION 3 — PLAYER / TARGET LISTS
+-- ============================================================
+local entries = {}
+local selUid = { follower = nil, target = nil }
+local nameByUid = {}
+
+local function buildListSection(title)
+	mk(body, "TextLabel", {
+		Size = UDim2.new(1, -16, 0, 16),
+		Position = UDim2.new(0, 8, 0, place(16, 4)),
+		BackgroundTransparency = 1,
+		Text = title,
+		TextColor3 = PAL.faint,
+		TextSize = 10.5,
+		Font = FONT.heading,
+		TextXAlignment = Enum.TextXAlignment.Left,
+	})
+	local scroller = mk(body, "ScrollingFrame", {
+		Size = UDim2.new(1, -16, 0, 104),
+		Position = UDim2.new(0, 8, 0, place(104, 8)),
+		BackgroundColor3 = PAL.card,
+		BorderSizePixel = 0,
+		ScrollBarThickness = 4,
+		ScrollBarImageColor3 = PAL.border,
+		CanvasSize = UDim2.fromOffset(0, 100),
+		VerticalScrollBarPosition = Enum.VerticalScrollBarPosition.Right,
+	})
+	uic(scroller, 6)
+	return { scroller = scroller, rows = {} }
+end
+
+local followerSection = buildListSection("PLAYER - THE TAPED ONE")
+local targetSection = buildListSection("TARGET")
+
+local function reloadList(section, role)
+	for _, row in ipairs(section.rows) do
+		row:Destroy()
+	end
+	section.rows = {}
+	for i, e in ipairs(entries) do
+		local row = mk(section.scroller, "TextButton", {
+			Size = UDim2.new(1, -8, 0, 26),
+			Position = UDim2.fromOffset(4, 4 + (i - 1) * 28),
+			BackgroundColor3 = PAL.panelSoft,
+			BorderSizePixel = 0,
+			AutoButtonColor = true,
+			Text = (e.isPlayer and "P  " or "N  ") .. e.name,
+			TextColor3 = PAL.text,
+			TextSize = 12,
+			Font = FONT.body,
+			TextXAlignment = Enum.TextXAlignment.Left,
+			TextTruncate = Enum.TextTruncate.AtEnd,
+		})
+		uic(row, 5)
+		local selected = selUid[role] == e.uid
+		if selected then
+			row.BackgroundColor3 = PAL.accent
+			row.TextColor3 = PAL.accentDark
+		end
+		mk(row, "Frame", {
+			Size = UDim2.fromOffset(5, 5),
+			Position = UDim2.new(1, -10, 0.5, -3),
+			AnchorPoint = Vector2.new(1, 0.5),
+			BackgroundColor3 = selected and PAL.accentDark or (e.isPlayer and PAL.blue or PAL.orange),
+			BorderSizePixel = 0,
+			ZIndex = 2,
+		})
+		row.Activated:Connect(function()
+			if selUid[role] == e.uid then return end
+			TapeRemote:FireServer("select", role, e.uid)
+		end)
+		table.insert(section.rows, row)
+	end
+	section.scroller.CanvasSize = UDim2.fromOffset(0, math.max(4 + #entries * 28 + 4, 106))
+end
+
+local function reloadAll()
+	reloadList(followerSection, "follower")
+	reloadList(targetSection, "target")
+end
+
+-- ============================================================
+--  SECTION 4 — SPAWN DUMMY
+-- ============================================================
+local spawnBtn = mk(body, "TextButton", {
+	Size = UDim2.new(1, -16, 0, 24),
+	Position = UDim2.new(0, 8, 0, place(24, 10)),
+	BackgroundColor3 = PAL.panelSoft,
+	BorderSizePixel = 0,
+	AutoButtonColor = true,
+	Text = "+  SPAWN WANDER DUMMY",
+	TextColor3 = PAL.dim,
+	TextSize = 11,
+	Font = FONT.heading,
+	ZIndex = 2,
+})
+uic(spawnBtn, 6)
+spawnBtn.Activated:Connect(function()
+	TapeRemote:FireServer("spawnDummy")
+end)
+
+-- ============================================================
+--  SECTION 5 — OFFSET / PREDICTION SLIDERS
+-- ============================================================
+mk(body, "TextLabel", {
+	Size = UDim2.new(1, -16, 0, 16),
+	Position = UDim2.new(0, 8, 0, place(16, 4)),
+	BackgroundTransparency = 1,
+	Text = "LOCAL OFFSET  x  PREDICTION",
+	TextColor3 = PAL.faint,
+	TextSize = 10.5,
+	Font = FONT.heading,
+	TextXAlignment = Enum.TextXAlignment.Left,
+})
+
+mk(body, "TextLabel", {
+	Size = UDim2.new(1, -16, 0, 16),
+	Position = UDim2.new(0, 16, 0, place(16, 4)),
+	BackgroundTransparency = 1,
+	Text = "offset = CFrame.new(side, height, dist)   (+Z = behind)",
+	TextColor3 = PAL.orange,
+	TextSize = 10,
+	Font = FONT.mono,
+	TextXAlignment = Enum.TextXAlignment.Left,
+	TextTruncate = Enum.TextTruncate.AtEnd,
+})
+
+local function commitParam(key)
+	return function(v)
+		TapeRemote:FireServer("param", key, v)
+	end
+end
+
+local function makeSlider(y, labelText, min, max, initial, decimals, onCommit)
+	local row = mk(body, "Frame", {
+		Position = UDim2.fromOffset(8, y),
+		Size = UDim2.new(1, -16, 0, 28),
+		BackgroundTransparency = 1,
+	})
+	mk(row, "TextLabel", {
+		Size = UDim2.fromOffset(96, 28),
+		BackgroundTransparency = 1,
+		Text = labelText,
+		TextColor3 = PAL.dim,
+		TextSize = 12,
+		Font = FONT.body,
+		TextXAlignment = Enum.TextXAlignment.Left,
+	})
+
+	local valueLbl = mk(row, "TextLabel", {
+		Size = UDim2.fromOffset(44, 28),
+		Position = UDim2.new(1, -48, 0, 0),
+		BackgroundTransparency = 1,
+		Text = "",
+		TextColor3 = PAL.accent,
+		TextSize = 12,
+		Font = FONT.mono,
+		TextXAlignment = Enum.TextXAlignment.Right,
+	})
+
+	local track = mk(row, "Frame", {
+		Size = UDim2.new(1, -150, 0, 3),
+		Position = UDim2.new(0, 100, 0.5, -2),
+		BackgroundColor3 = PAL.panelSoft,
+		BorderSizePixel = 0,
+	})
+	uic(track, 2)
+
+	local fill = mk(track, "Frame", {
+		Size = UDim2.new(0.5, 0, 1, 0),
+		BackgroundColor3 = PAL.accent,
+		BorderSizePixel = 0,
+	})
+	uic(fill, 2)
+
+	local handle = mk(track, "Frame", {
+		Size = UDim2.fromOffset(12, 12),
+		AnchorPoint = Vector2.new(0.5, 0.5),
+		Position = UDim2.new(0.5, 0, 0.5, 0),
+		BackgroundColor3 = PAL.text,
+		BorderSizePixel = 0,
+		ZIndex = 3,
+	})
+	uic(handle, 6)
+
+	local current = initial
+	local dragging = false
+
+	local function draw()
+		local t = (current - min) / (max - min)
+		fill.Size = UDim2.new(t, 0, 1, 0)
+		handle.Position = UDim2.new(t, 0, 0.5, 0)
+		valueLbl.Text = string.format("%." .. decimals .. "f", current)
+	end
+
+	local function fromX(x)
+		local ax = track.AbsolutePosition.X
+		local w = math.max(track.AbsoluteSize.X, 1)
+		local t = math.clamp((x - ax) / w, 0, 1)
+		current = min + (max - min) * t
+		draw()
+	end
+
+	track.InputBegan:Connect(function(input)
+		if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+			dragging = true
+			fromX(input.Position.X)
+		end
+	end)
+	UserInputService.InputChanged:Connect(function(input)
+		if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch) then
+			fromX(input.Position.X)
+		end
+	end)
+	UserInputService.InputEnded:Connect(function(input)
+		if dragging and (input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch) then
+			dragging = false
+			onCommit(current)
+		end
+	end)
+
+	draw()
+	return {
+		set = function(v)
+			current = v
+			draw()
+		end,
+	}
+end
+
+local sideSlider = makeSlider(place(28, 0), "side X", -6, 6, 0, 1, commitParam("side"))
+local heightSlider = makeSlider(place(28, 0), "height Y", -4, 8, 0, 1, commitParam("height"))
+local distSlider = makeSlider(place(28, 0), "distance Z", -10, 15, 5, 1, commitParam("dist"))
+local predSlider = makeSlider(place(28, 8), "predict s", 0.1, 3, 1, 2, commitParam("predTime"))
+
+-- ============================================================
+--  SECTION 6 — STATUS / LEGEND / HINT
+-- ============================================================
+local statusLbl = mk(body, "TextLabel", {
+	Size = UDim2.new(1, -16, 0, 18),
+	Position = UDim2.new(0, 8, 0, place(18, 6)),
+	BackgroundTransparency = 1,
+	Text = "TAPE   -",
+	TextColor3 = PAL.accent,
+	TextSize = 12,
+	Font = FONT.mono,
+	TextXAlignment = Enum.TextXAlignment.Left,
+})
+
+mk(body, "TextLabel", {
+	Size = UDim2.new(1, -16, 0, 34),
+	Position = UDim2.new(0, 8, 0, place(34, 4)),
+	BackgroundTransparency = 1,
+	Text = "BLUE ring = Player   RED ring = Target\nGREEN ghost = taped spot   WHITE ribbon = the tape\nORANGE dot = predicted position",
+	TextColor3 = PAL.faint,
+	TextSize = 10.5,
+	Font = FONT.body,
+	TextWrapped = true,
+	TextXAlignment = Enum.TextXAlignment.Left,
+	TextYAlignment = Enum.TextYAlignment.Top,
+})
+
+local hintLbl = mk(body, "TextLabel", {
+	Size = UDim2.new(1, -16, 0, 42),
+	Position = UDim2.new(0, 8, 0, place(42, 6)),
+	BackgroundColor3 = PAL.card,
+	BorderSizePixel = 0,
+	Text = "STICK ON = follower is locked to the target's LOCAL offset, not chasing it.\nPick a dummy (spawn one above) or another player as TARGET to try it.",
+	TextColor3 = PAL.dim,
+	TextSize = 10.5,
+	Font = FONT.body,
+	TextWrapped = true,
+	TextXAlignment = Enum.TextXAlignment.Left,
+	TextYAlignment = Enum.TextYAlignment.Top,
+})
+uic(hintLbl, 6)
+
+-- final canvas height
+body.CanvasSize = UDim2.fromOffset(0, cursorY + 10)
+
+-- ============================================================
+--  STATE SYNC FROM SERVER
+-- ============================================================
+local function applyList(list)
+	local changed = #list ~= #entries
+	if not changed then
+		for i, e in ipairs(list) do
+			local o = entries[i]
+			if not o or o.uid ~= e.uid or o.isPlayer ~= e.isPlayer or o.name ~= e.name then
+				changed = true
+				break
+			end
+		end
+	end
+	entries = list
+	nameByUid = {}
+	for _, e in ipairs(entries) do
+		nameByUid[e.uid] = e.name
+	end
+	if changed then
+		reloadAll()
+	end
+end
+
+local lastStatusKeys = {}
+
+local function applyStatus(s)
+	local keys = {
+		s.followerUid,
+		s.targetUid,
+		not not s.tapeOn,
+		not not s.predOn,
+		s.side,
+		s.height,
+		s.dist,
+		s.predTime,
+	}
+	local same = #lastStatusKeys == #keys
+	if same then
+		for i = 1, #keys do
+			if keys[i] ~= lastStatusKeys[i] then
+				same = false
+				break
+			end
+		end
+	end
+	if same then
+		return
+	end
+	lastStatusKeys = keys
+
+	selUid.follower = s.followerUid
+	selUid.target = s.targetUid
+
+	stickToggle.setActive(not not s.tapeOn)
+	predToggle.setActive(not not s.predOn)
+	sideSlider.set(s.side or 0)
+	heightSlider.set(s.height or 0)
+	distSlider.set(s.dist or 5)
+	predSlider.set(s.predTime or 1)
+	reloadAll()
+
+	local fn = nameByUid[s.followerUid] or "?"
+	local tn = nameByUid[s.targetUid] or "?"
+	if s.followerUid and s.followerUid == s.targetUid then
+		statusLbl.Text = "TAPE   same char - pick a different target"
+		statusLbl.TextColor3 = PAL.red
+	else
+		statusLbl.Text = "TAPE   " .. fn .. "  <->  " .. tn
+		statusLbl.TextColor3 = PAL.accent
+	end
+end
+
+TapeRemote.OnClientEvent:Connect(function(kind, payload)
+	if kind == "list" then
+		applyList(payload)
+	elseif kind == "status" then
+		applyStatus(payload)
+	end
+end)
+
+-- ============================================================
+--  DRAG / COLLAPSE / CLOSE / REOPEN
+-- ============================================================
+local dragging = false
+local grabOffset = Vector2.zero
+
+header.InputBegan:Connect(function(input)
+	if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+		dragging = true
+		local pos = panel.AbsolutePosition
+		grabOffset = Vector2.new(input.Position.X - pos.X, input.Position.Y - pos.Y)
+	end
+end)
+
+UserInputService.InputChanged:Connect(function(input)
+	if dragging and panel.Visible and (input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch) then
+		panel.Position = UDim2.fromOffset(input.Position.X - grabOffset.X, input.Position.Y - grabOffset.Y)
+	end
+end)
+
+UserInputService.InputEnded:Connect(function(input)
+	if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+		dragging = false
+	end
+end)
+
+local collapsed = false
+collapseBtn.Activated:Connect(function()
+	collapsed = not collapsed
+	local targetH = collapsed and HDR_H or PANEL_H
+	TweenService:Create(panel, TweenInfo.new(0.14, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), {
+		Size = UDim2.fromOffset(PANEL_W, targetH),
+	}):Play()
+	collapseBtn.Text = collapsed and "+" or "-"
+	body.Visible = not collapsed
+end)
+
+local reopen = mk(screenGui, "TextButton", {
+	Name = "Reopen",
+	Size = UDim2.fromOffset(118, 34),
+	Position = UDim2.new(1, -134, 1, -60),
+	Visible = false,
+	BackgroundColor3 = PAL.accent,
+	BorderSizePixel = 0,
+	AutoButtonColor = true,
+	Text = "+  TAPE METHOD",
+	TextColor3 = PAL.accentDark,
+	Font = FONT.heading,
+	TextSize = 12,
+	ZIndex = 5,
+})
+uic(reopen, 8)
+
+closeBtn.Activated:Connect(function()
+	panel.Visible = false
+	reopen.Visible = true
+end)
+
+reopen.Activated:Connect(function()
+	panel.Visible = true
+	reopen.Visible = false
+end)
+
+-- ============================================================
+--  GO
+-- ============================================================
+TapeRemote:FireServer("init")
+-- ==[ PART 2 END ]==
+
+============================================================
+ SETUP (60 seconds):
+ 1. Studio -> open a Baseplate place.
+ 2. ServerScriptService (Explorer) -> right-click -> Insert Object
+    -> Script -> rename TapeMethodServer -> paste PART 1.
+ 3. StarterPlayerScripts -> right-click -> Insert Object
+    -> LocalScript -> rename TapeMethodClient -> paste PART 2.
+ 4. Press Play. Panel opens bottom-right; a wander dummy is spawned
+    and auto-selected as TARGET. Flip STICK ON to tape yourself to it.
+
+ HOW IT WORKS (the "tape / autofarm" math):
+   desiredCFrame = Target.CFrame * CFrame.new(side, height, dist)
+ The follower is locked onto the Target local offset every frame, so it
+ moves AND rotates WITH the Target - stick follow, not chase.
+============================================================
