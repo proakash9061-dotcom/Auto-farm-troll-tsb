@@ -1,0 +1,400 @@
+-- Tape Method Prototype (LocalScript)
+-- Place in StarterPlayerScripts
+
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
+local TweenService = game:GetService("TweenService")
+
+local localPlayer = Players.LocalPlayer
+local mouse = localPlayer:GetMouse()
+
+-- ========== DUMMY SETUP ==========
+local function createDummy(name, position, color)
+	local model = Instance.new("Model")
+	model.Name = name
+	
+	local hrp = Instance.new("Part")
+	hrp.Name = "HumanoidRootPart"
+	hrp.Size = Vector3.new(2, 2, 1)
+	hrp.Position = position
+	hrp.Anchored = true
+	hrp.BrickColor = BrickColor.new(color)
+	hrp.CanCollide = false
+	hrp.Parent = model
+	
+	local humanoid = Instance.new("Humanoid")
+	humanoid.Parent = model
+	
+	local head = Instance.new("Part")
+	head.Name = "Head"
+	head.Size = Vector3.new(1.2, 1.2, 1.2)
+	head.Position = position + Vector3.new(0, 1.6, 0)
+	head.Anchored = true
+	head.BrickColor = BrickColor.new(color)
+	head.CanCollide = false
+	head.Parent = model
+	
+	local billboard = Instance.new("BillboardGui")
+	billboard.Size = UDim2.new(0, 100, 0, 30)
+	billboard.StudsOffset = Vector3.new(0, 2.5, 0)
+	billboard.AlwaysOnTop = true
+	billboard.Parent = head
+	
+	local nameLabel = Instance.new("TextLabel")
+	nameLabel.Size = UDim2.new(1, 0, 1, 0)
+	nameLabel.BackgroundTransparency = 1
+	nameLabel.Text = name
+	nameLabel.TextColor3 = Color3.fromRGB(255, 255, 255)
+	nameLabel.TextStrokeTransparency = 0.5
+	nameLabel.Font = Enum.Font.GothamBold
+	nameLabel.TextSize = 14
+	nameLabel.Parent = billboard
+	
+	model.PrimaryPart = hrp
+	model.Parent = workspace
+	return model
+end
+
+-- Create Player dummy + 4 Target dummies
+local playerDummy = createDummy("Player (You)", Vector3.new(0, 5, 0), "Bright blue")
+local targets = {
+	createDummy("Target_A", Vector3.new(15, 5, 0), "Bright red"),
+	createDummy("Target_B", Vector3.new(-12, 5, 8), "Bright green"),
+	createDummy("Target_C", Vector3.new(8, 5, -14), "Bright yellow"),
+	createDummy("Target_D", Vector3.new(-5, 5, 18), "Bright violet"),
+}
+
+-- Make Target_A slowly move + rotate so you can see the tape effect
+local moveConn
+local function startTargetMovement(targetModel)
+	if moveConn then moveConn:Disconnect() end
+	local hrp = targetModel.PrimaryPart
+	local t = 0
+	moveConn = RunService.Heartbeat:Connect(function(dt)
+		t += dt
+		hrp.CFrame = CFrame.new(
+			math.sin(t * 0.6) * 12,
+			5 + math.sin(t * 1.2) * 1.5,
+			math.cos(t * 0.45) * 10
+		) * CFrame.Angles(0, t * 0.8, 0)
+	end)
+end
+startTargetMovement(targets[1])
+
+-- ========== MARKERS + TAPE LINE ==========
+local playerMarker = Instance.new("Part")
+playerMarker.Name = "PlayerMarker"
+playerMarker.Size = Vector3.new(1.4, 1.4, 1.4)
+playerMarker.Shape = Enum.PartType.Ball
+playerMarker.BrickColor = BrickColor.new("Cyan")
+playerMarker.Material = Enum.Material.Neon
+playerMarker.Anchored = true
+playerMarker.CanCollide = false
+playerMarker.Parent = workspace
+
+local targetMarker = Instance.new("Part")
+targetMarker.Name = "TargetMarker"
+targetMarker.Size = Vector3.new(1.6, 1.6, 1.6)
+targetMarker.Shape = Enum.PartType.Ball
+targetMarker.BrickColor = BrickColor.new("Really red")
+targetMarker.Material = Enum.Material.Neon
+targetMarker.Anchored = true
+targetMarker.CanCollide = false
+targetMarker.Parent = workspace
+
+local tapeLine = Instance.new("Part")
+tapeLine.Name = "TapeLine"
+tapeLine.Size = Vector3.new(0.15, 0.15, 1)
+tapeLine.Anchored = true
+tapeLine.CanCollide = false
+tapeLine.Material = Enum.Material.Neon
+tapeLine.BrickColor = BrickColor.new("White")
+tapeLine.Transparency = 0.3
+tapeLine.Parent = workspace
+
+local predictionMarker = Instance.new("Part")
+predictionMarker.Name = "PredictionMarker"
+predictionMarker.Size = Vector3.new(1.1, 1.1, 1.1)
+predictionMarker.Shape = Enum.PartType.Ball
+predictionMarker.BrickColor = BrickColor.new("Lime green")
+predictionMarker.Material = Enum.Material.Neon
+predictionMarker.Anchored = true
+predictionMarker.CanCollide = false
+predictionMarker.Transparency = 0.4
+predictionMarker.Parent = workspace
+predictionMarker.Visible = false
+
+-- ========== GUI ==========
+local screenGui = Instance.new("ScreenGui")
+screenGui.Name = "TapeMethodGUI"
+screenGui.ResetOnSpawn = false
+screenGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+screenGui.Parent = localPlayer:WaitForChild("PlayerGui")
+
+local mainFrame = Instance.new("Frame")
+mainFrame.Name = "MainPanel"
+mainFrame.Size = UDim2.new(0, 260, 0, 420)
+mainFrame.Position = UDim2.new(0, 20, 0.5, -210)
+mainFrame.BackgroundColor3 = Color3.fromRGB(18, 18, 22)
+mainFrame.BorderSizePixel = 0
+mainFrame.Active = true
+mainFrame.Draggable = true
+mainFrame.Parent = screenGui
+
+local corner = Instance.new("UICorner")
+corner.CornerRadius = UDim.new(0, 8)
+corner.Parent = mainFrame
+
+local stroke = Instance.new("UIStroke")
+stroke.Color = Color3.fromRGB(45, 45, 55)
+stroke.Thickness = 1
+stroke.Parent = mainFrame
+
+-- Title bar
+local titleBar = Instance.new("Frame")
+titleBar.Size = UDim2.new(1, 0, 0, 32)
+titleBar.BackgroundColor3 = Color3.fromRGB(28, 28, 34)
+titleBar.BorderSizePixel = 0
+titleBar.Parent = mainFrame
+
+local titleCorner = Instance.new("UICorner")
+titleCorner.CornerRadius = UDim.new(0, 8)
+titleCorner.Parent = titleBar
+
+local titleFix = Instance.new("Frame")
+titleFix.Size = UDim2.new(1, 0, 0, 10)
+titleFix.Position = UDim2.new(0, 0, 1, -10)
+titleFix.BackgroundColor3 = Color3.fromRGB(28, 28, 34)
+titleFix.BorderSizePixel = 0
+titleFix.Parent = titleBar
+
+local titleLabel = Instance.new("TextLabel")
+titleLabel.Size = UDim2.new(1, -70, 1, 0)
+titleLabel.Position = UDim2.new(0, 10, 0, 0)
+titleLabel.BackgroundTransparency = 1
+titleLabel.Text = "Tape Method"
+titleLabel.TextColor3 = Color3.fromRGB(220, 220, 230)
+titleLabel.Font = Enum.Font.GothamBold
+titleLabel.TextSize = 14
+titleLabel.TextXAlignment = Enum.TextXAlignment.Left
+titleLabel.Parent = titleBar
+
+local closeBtn = Instance.new("TextButton")
+closeBtn.Size = UDim2.new(0, 28, 0, 22)
+closeBtn.Position = UDim2.new(1, -32, 0.5, -11)
+closeBtn.BackgroundColor3 = Color3.fromRGB(60, 30, 30)
+closeBtn.Text = "✕"
+closeBtn.TextColor3 = Color3.fromRGB(255, 180, 180)
+closeBtn.Font = Enum.Font.GothamBold
+closeBtn.TextSize = 12
+closeBtn.Parent = titleBar
+Instance.new("UICorner", closeBtn).CornerRadius = UDim.new(0, 4)
+
+local collapseBtn = Instance.new("TextButton")
+collapseBtn.Size = UDim2.new(0, 28, 0, 22)
+collapseBtn.Position = UDim2.new(1, -64, 0.5, -11)
+collapseBtn.BackgroundColor3 = Color3.fromRGB(35, 35, 45)
+collapseBtn.Text = "−"
+collapseBtn.TextColor3 = Color3.fromRGB(200, 200, 210)
+collapseBtn.Font = Enum.Font.GothamBold
+collapseBtn.TextSize = 14
+collapseBtn.Parent = titleBar
+Instance.new("UICorner", collapseBtn).CornerRadius = UDim.new(0, 4)
+
+-- Content
+local content = Instance.new("Frame")
+content.Name = "Content"
+content.Size = UDim2.new(1, -16, 1, -48)
+content.Position = UDim2.new(0, 8, 0, 40)
+content.BackgroundTransparency = 1
+content.Parent = mainFrame
+
+local listLabel = Instance.new("TextLabel")
+listLabel.Size = UDim2.new(1, 0, 0, 20)
+listLabel.BackgroundTransparency = 1
+listLabel.Text = "Select Target"
+listLabel.TextColor3 = Color3.fromRGB(160, 160, 175)
+listLabel.Font = Enum.Font.Gotham
+listLabel.TextSize = 12
+listLabel.TextXAlignment = Enum.TextXAlignment.Left
+listLabel.Parent = content
+
+local targetList = Instance.new("ScrollingFrame")
+targetList.Size = UDim2.new(1, 0, 0, 110)
+targetList.Position = UDim2.new(0, 0, 0, 22)
+targetList.BackgroundColor3 = Color3.fromRGB(25, 25, 30)
+targetList.BorderSizePixel = 0
+targetList.ScrollBarThickness = 4
+targetList.CanvasSize = UDim2.new(0, 0, 0, 0)
+targetList.Parent = content
+Instance.new("UICorner", targetList).CornerRadius = UDim.new(0, 6)
+
+local listLayout = Instance.new("UIListLayout")
+listLayout.Padding = UDim.new(0, 4)
+listLayout.Parent = targetList
+
+local selectedTarget = targets[1]
+local offset = CFrame.new(0, 0, 5) -- fixed local offset (behind target)
+
+local function refreshList()
+	for _, child in ipairs(targetList:GetChildren()) do
+		if child:IsA("TextButton") then child:Destroy() end
+	end
+	for i, t in ipairs(targets) do
+		local btn = Instance.new("TextButton")
+		btn.Size = UDim2.new(1, -8, 0, 26)
+		btn.BackgroundColor3 = (t == selectedTarget) and Color3.fromRGB(50, 90, 140) or Color3.fromRGB(35, 35, 42)
+		btn.Text = "  " .. t.Name
+		btn.TextColor3 = Color3.fromRGB(230, 230, 240)
+		btn.Font = Enum.Font.Gotham
+		btn.TextSize = 13
+		btn.TextXAlignment = Enum.TextXAlignment.Left
+		btn.Parent = targetList
+		Instance.new("UICorner", btn).CornerRadius = UDim.new(0, 4)
+		
+		btn.MouseButton1Click:Connect(function()
+			selectedTarget = t
+			startTargetMovement(t)
+			refreshList()
+		end)
+	end
+	targetList.CanvasSize = UDim2.new(0, 0, 0, #targets * 30)
+end
+refreshList()
+
+-- Prediction toggle
+local predToggle = Instance.new("TextButton")
+predToggle.Size = UDim2.new(1, 0, 0, 30)
+predToggle.Position = UDim2.new(0, 0, 0, 145)
+predToggle.BackgroundColor3 = Color3.fromRGB(40, 40, 50)
+predToggle.Text = "Prediction: OFF"
+predToggle.TextColor3 = Color3.fromRGB(200, 200, 210)
+predToggle.Font = Enum.Font.Gotham
+predToggle.TextSize = 13
+predToggle.Parent = content
+Instance.new("UICorner", predToggle).CornerRadius = UDim.new(0, 6)
+
+local predictionOn = false
+predToggle.MouseButton1Click:Connect(function()
+	predictionOn = not predictionOn
+	predToggle.Text = predictionOn and "Prediction: ON" or "Prediction: OFF"
+	predToggle.BackgroundColor3 = predictionOn and Color3.fromRGB(40, 80, 50) or Color3.fromRGB(40, 40, 50)
+	predictionMarker.Visible = predictionOn
+end)
+
+-- Explanation
+local expFrame = Instance.new("Frame")
+expFrame.Size = UDim2.new(1, 0, 0, 160)
+expFrame.Position = UDim2.new(0, 0, 0, 185)
+expFrame.BackgroundColor3 = Color3.fromRGB(25, 25, 30)
+expFrame.BorderSizePixel = 0
+expFrame.Parent = content
+Instance.new("UICorner", expFrame).CornerRadius = UDim.new(0, 6)
+
+local expText = Instance.new("TextLabel")
+expText.Size = UDim2.new(1, -12, 1, -12)
+expText.Position = UDim2.new(0, 6, 0, 6)
+expText.BackgroundTransparency = 1
+expText.Text = [[Normal chase = repeatedly move toward Target's current world position.
+
+Tape Method = Target becomes the reference coordinate system.
+Our position is defined relative to Target:
+
+desiredCFrame = Target.CFrame * CFrame.new(0, 0, 5)
+
+When Target moves → we move with it.
+When Target rotates → the offset rotates with it.
+
+The white line = imaginary "tape".]]
+expText.TextColor3 = Color3.fromRGB(170, 170, 185)
+expText.Font = Enum.Font.Gotham
+expText.TextSize = 11
+expText.TextWrapped = true
+expText.TextYAlignment = Enum.TextYAlignment.Top
+expText.Parent = expFrame
+
+-- Collapsed state
+local isCollapsed = false
+local originalSize = mainFrame.Size
+
+collapseBtn.MouseButton1Click:Connect(function()
+	isCollapsed = not isCollapsed
+	if isCollapsed then
+		content.Visible = false
+		mainFrame.Size = UDim2.new(0, 260, 0, 32)
+		collapseBtn.Text = "+"
+	else
+		content.Visible = true
+		mainFrame.Size = originalSize
+		collapseBtn.Text = "−"
+	end
+end)
+
+local isOpen = true
+closeBtn.MouseButton1Click:Connect(function()
+	isOpen = not isOpen
+	mainFrame.Visible = isOpen
+end)
+
+-- Open button when closed (small floating)
+local openBtn = Instance.new("TextButton")
+openBtn.Size = UDim2.new(0, 90, 0, 28)
+openBtn.Position = UDim2.new(0, 20, 0, 20)
+openBtn.BackgroundColor3 = Color3.fromRGB(30, 30, 38)
+openBtn.Text = "Tape Method"
+openBtn.TextColor3 = Color3.fromRGB(200, 200, 210)
+openBtn.Font = Enum.Font.GothamBold
+openBtn.TextSize = 12
+openBtn.Visible = false
+openBtn.Parent = screenGui
+Instance.new("UICorner", openBtn).CornerRadius = UDim.new(0, 6)
+
+closeBtn.MouseButton1Click:Connect(function()
+	mainFrame.Visible = false
+	openBtn.Visible = true
+end)
+openBtn.MouseButton1Click:Connect(function()
+	mainFrame.Visible = true
+	openBtn.Visible = false
+end)
+
+-- ========== TAPE METHOD LOGIC ==========
+local lastTargetPos = Vector3.zero
+local lastTargetTime = tick()
+
+RunService.RenderStepped:Connect(function()
+	if not selectedTarget or not selectedTarget.PrimaryPart then return end
+	
+	local targetCF = selectedTarget.PrimaryPart.CFrame
+	local desiredCF = targetCF * offset   -- THE TAPE METHOD
+	
+	-- Move player dummy + marker
+	playerDummy.PrimaryPart.CFrame = desiredCF
+	playerMarker.CFrame = desiredCF
+	
+	-- Target marker
+	targetMarker.CFrame = targetCF
+	
+	-- Tape line (visual)
+	local mid = (desiredCF.Position + targetCF.Position) / 2
+	local dist = (desiredCF.Position - targetCF.Position).Magnitude
+	tapeLine.Size = Vector3.new(0.12, 0.12, dist)
+	tapeLine.CFrame = CFrame.lookAt(mid, targetCF.Position) * CFrame.new(0, 0, 0)
+	
+	-- Prediction (simple velocity based)
+	if predictionOn then
+		local now = tick()
+		local dt = now - lastTargetTime
+		if dt > 0.001 then
+			local velocity = (targetCF.Position - lastTargetPos) / dt
+			local futurePos = targetCF.Position + velocity * 0.35 -- look ahead
+			local futureCF = CFrame.new(futurePos) * (targetCF - targetCF.Position)
+			predictionMarker.CFrame = futureCF * offset
+		end
+		lastTargetPos = targetCF.Position
+		lastTargetTime = now
+	end
+end)
+
+print("Tape Method prototype loaded. Select a target and watch the relationship.")
