@@ -1,0 +1,939 @@
+--[[
+    UNIVERSAL MOUNT & ATTACH SYSTEM — PRO V3
+    Roblox Studio / Private Experience Utility
+    ---------------------------------------------------------------
+    Compact professional-style Luau architecture.
+
+    Includes:
+      • Small movable window
+      • Minimize / restore / destroy buttons
+      • Collapsible feature sections
+      • Player + NPC/Dummy target browser
+      • Live target refresh
+      • Back mount distance + height controls
+      • PreSimulation + PivotTo positioning
+      • Local collision/touch/query protection
+      • Local physics stabilization
+      • Safe Mode + proximity shield
+      • Auto-remount after selected player respawns
+      • Local Health Lock test mode
+      • Central connection cleanup
+
+    IMPORTANT:
+      This is intended for experiences you own or are authorized to test.
+      Client-side code cannot override a server-authoritative Carry/Hug/
+      Grab/Damage system. Real protection must be implemented server-side.
+]]
+
+--// Services
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local Workspace = game:GetService("Workspace")
+local UserInputService = game:GetService("UserInputService")
+
+local LocalPlayer = Players.LocalPlayer
+
+--// Configuration
+local Config = {
+    Distance = 2.0,
+    Height = 0.0,
+    SafeMode = false,
+    AutoShield = false,
+    AutoRemount = true,
+    HealthLock = false,
+    ZeroVelocity = true,
+    NoCollision = true,
+    ShieldRadius = 8,
+}
+
+--==============================================================
+-- Connection Registry
+--==============================================================
+
+local Connections = {}
+
+local function connect(signal, callback)
+    local connection = signal:Connect(callback)
+    table.insert(Connections, connection)
+    return connection
+end
+
+local function disconnectAll()
+    for _, connection in ipairs(Connections) do
+        if connection and connection.Connected then
+            connection:Disconnect()
+        end
+    end
+    table.clear(Connections)
+end
+
+--==============================================================
+-- Character Helpers
+--==============================================================
+
+local function humanoidOf(model)
+    return model and model:FindFirstChildOfClass("Humanoid")
+end
+
+local function rootOf(model)
+    if not model or not model:IsA("Model") then
+        return nil
+    end
+    return model:FindFirstChild("HumanoidRootPart") or model.PrimaryPart
+end
+
+local function validCharacter(model)
+    return model
+        and model:IsA("Model")
+        and model ~= LocalPlayer.Character
+        and rootOf(model) ~= nil
+        and humanoidOf(model) ~= nil
+end
+
+--==============================================================
+-- Target Service
+--==============================================================
+
+local TargetService = {
+    Items = {},
+    Labels = {},
+    SelectedLabel = nil,
+    SelectedModel = nil,
+    TrackedPlayer = nil,
+}
+
+function TargetService:Clear()
+    table.clear(self.Items)
+    table.clear(self.Labels)
+end
+
+function TargetService:Add(label, model)
+    if not validCharacter(model) then
+        return
+    end
+    if self.Items[label] then
+        return
+    end
+    self.Items[label] = model
+    table.insert(self.Labels, label)
+end
+
+function TargetService:Refresh()
+    self:Clear()
+
+    for _, player in ipairs(Players:GetPlayers()) do
+        if player ~= LocalPlayer and player.Character then
+            local label = string.format("PLAYER  •  %s  (@%s)", player.DisplayName, player.Name)
+            self:Add(label, player.Character)
+        end
+    end
+
+    for _, object in ipairs(Workspace:GetDescendants()) do
+        if object:IsA("Model") and not Players:GetPlayerFromCharacter(object) then
+            if validCharacter(object) then
+                self:Add("NPC  •  " .. object.Name, object)
+            end
+        end
+    end
+
+    table.sort(self.Labels)
+    return self.Labels
+end
+
+function TargetService:Select(label)
+    local model = self.Items[label]
+    if not validCharacter(model) then
+        self.SelectedLabel = nil
+        self.SelectedModel = nil
+        return false
+    end
+
+    self.SelectedLabel = label
+    self.SelectedModel = model
+
+    local player = Players:GetPlayerFromCharacter(model)
+    if player then
+        self:TrackPlayer(player)
+    else
+        self:StopTracking()
+    end
+
+    return true
+end
+
+function TargetService:Get()
+    if self.SelectedModel and self.SelectedModel.Parent and rootOf(self.SelectedModel) then
+        return self.SelectedModel
+    end
+    return nil
+end
+
+function TargetService:StopTracking()
+    self.TrackedPlayer = nil
+end
+
+function TargetService:TrackPlayer(player)
+    self.TrackedPlayer = player
+end
+
+--==============================================================
+-- Local Defense Service
+--==============================================================
+
+local DefenseService = {
+    Active = false,
+    Saved = {},
+}
+
+function DefenseService:Save(part)
+    if self.Saved[part] then
+        return
+    end
+    self.Saved[part] = {
+        CanCollide = part.CanCollide,
+        CanTouch = part.CanTouch,
+        CanQuery = part.CanQuery,
+    }
+end
+
+function DefenseService:Enable()
+    self.Active = true
+    local character = LocalPlayer.Character
+    if not character then return end
+
+    for _, object in ipairs(character:GetDescendants()) do
+        if object:IsA("BasePart") then
+            self:Save(object)
+            object.CanTouch = false
+            object.CanQuery = false
+            if Config.NoCollision then
+                object.CanCollide = false
+            end
+        end
+    end
+end
+
+function DefenseService:Step()
+    if not self.Active then return end
+    local character = LocalPlayer.Character
+    if not character then return end
+
+    for _, object in ipairs(character:GetDescendants()) do
+        if object:IsA("BasePart") then
+            self:Save(object)
+            object.CanTouch = false
+            object.CanQuery = false
+            if Config.NoCollision then
+                object.CanCollide = false
+            end
+        end
+    end
+
+    if Config.ZeroVelocity then
+        local root = rootOf(character)
+        if root then
+            root.AssemblyLinearVelocity = Vector3.zero
+            root.AssemblyAngularVelocity = Vector3.zero
+        end
+    end
+end
+
+function DefenseService:Disable()
+    self.Active = false
+    for part, values in pairs(self.Saved) do
+        if part and part.Parent then
+            part.CanCollide = values.CanCollide
+            part.CanTouch = values.CanTouch
+            part.CanQuery = values.CanQuery
+        end
+    end
+    table.clear(self.Saved)
+end
+
+--==============================================================
+-- Mount Service
+--==============================================================
+
+local MountService = {
+    Enabled = false,
+}
+
+function MountService:Calculate(target)
+    local targetRoot = rootOf(target)
+    if not targetRoot then return nil end
+
+    local position = targetRoot.Position
+        - targetRoot.CFrame.LookVector * Config.Distance
+        + Vector3.new(0, Config.Height, 0)
+
+    return CFrame.lookAt(
+        position,
+        position + targetRoot.CFrame.LookVector
+    )
+end
+
+function MountService:Step()
+    if not self.Enabled then return end
+
+    local character = LocalPlayer.Character
+    local target = TargetService:Get()
+    if not character or not target then return end
+
+    local humanoid = humanoidOf(character)
+    if not humanoid or humanoid.Health <= 0 then return end
+
+    local targetHumanoid = humanoidOf(target)
+    if targetHumanoid and targetHumanoid.Health <= 0 then
+        return
+    end
+
+    local destination = self:Calculate(target)
+    if destination then
+        character:PivotTo(destination)
+        DefenseService:Step()
+    end
+end
+
+function MountService:Enable()
+    if not TargetService:Get() then
+        return false
+    end
+    self.Enabled = true
+    DefenseService:Enable()
+    return true
+end
+
+function MountService:Disable()
+    self.Enabled = false
+    if not Config.SafeMode and not Config.AutoShield then
+        DefenseService:Disable()
+    end
+end
+
+--==============================================================
+-- GUI
+--==============================================================
+
+local Gui = Instance.new("ScreenGui")
+Gui.Name = "UniversalMountPro"
+Gui.ResetOnSpawn = false
+Gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+Gui.Parent = LocalPlayer:WaitForChild("PlayerGui")
+
+local Window = Instance.new("Frame")
+Window.Size = UDim2.fromOffset(300, 380)
+Window.Position = UDim2.new(0, 22, 0.5, -190)
+Window.BackgroundColor3 = Color3.fromRGB(18, 18, 24)
+Window.BorderSizePixel = 0
+Window.Parent = Gui
+
+local windowCorner = Instance.new("UICorner")
+windowCorner.CornerRadius = UDim.new(0, 11)
+windowCorner.Parent = Window
+
+local windowStroke = Instance.new("UIStroke")
+windowStroke.Color = Color3.fromRGB(62, 62, 78)
+windowStroke.Thickness = 1
+windowStroke.Parent = Window
+
+local Header = Instance.new("Frame")
+Header.Size = UDim2.new(1, 0, 0, 42)
+Header.BackgroundTransparency = 1
+Header.Parent = Window
+
+local HeaderText = Instance.new("TextLabel")
+HeaderText.Size = UDim2.new(1, -78, 1, 0)
+HeaderText.Position = UDim2.fromOffset(12, 0)
+HeaderText.BackgroundTransparency = 1
+HeaderText.Text = "◆  UNIVERSAL MOUNT"
+HeaderText.TextColor3 = Color3.fromRGB(238, 238, 245)
+HeaderText.Font = Enum.Font.GothamBold
+HeaderText.TextSize = 13
+HeaderText.TextXAlignment = Enum.TextXAlignment.Left
+HeaderText.Parent = Header
+
+local function headerButton(text, x, bg)
+    local b = Instance.new("TextButton")
+    b.Size = UDim2.fromOffset(28, 26)
+    b.Position = UDim2.new(1, x, 0, 8)
+    b.BackgroundColor3 = bg
+    b.Text = text
+    b.TextColor3 = Color3.fromRGB(235,235,245)
+    b.Font = Enum.Font.GothamBold
+    b.TextSize = 14
+    b.Parent = Header
+    local c = Instance.new("UICorner")
+    c.CornerRadius = UDim.new(0, 7)
+    c.Parent = b
+    return b
+end
+
+local MinimizeButton = headerButton("—", -63, Color3.fromRGB(32,32,42))
+local CloseButton = headerButton("×", -31, Color3.fromRGB(47,28,35))
+
+--// Drag support
+local dragging = false
+local dragStart
+local windowStart
+
+connect(Header.InputBegan, function(input)
+    if input.UserInputType == Enum.UserInputType.MouseButton1
+        or input.UserInputType == Enum.UserInputType.Touch then
+        dragging = true
+        dragStart = input.Position
+        windowStart = Window.Position
+    end
+end)
+
+connect(UserInputService.InputChanged, function(input)
+    if not dragging then return end
+    if input.UserInputType ~= Enum.UserInputType.MouseMovement
+        and input.UserInputType ~= Enum.UserInputType.Touch then
+        return
+    end
+
+    local delta = input.Position - dragStart
+    Window.Position = UDim2.new(
+        windowStart.X.Scale,
+        windowStart.X.Offset + delta.X,
+        windowStart.Y.Scale,
+        windowStart.Y.Offset + delta.Y
+    )
+end)
+
+connect(UserInputService.InputEnded, function(input)
+    if input.UserInputType == Enum.UserInputType.MouseButton1
+        or input.UserInputType == Enum.UserInputType.Touch then
+        dragging = false
+    end
+end)
+
+local Restore = Instance.new("TextButton")
+Restore.Size = UDim2.fromOffset(140, 34)
+Restore.Position = UDim2.new(0, 22, 0.5, -17)
+Restore.BackgroundColor3 = Color3.fromRGB(22,22,30)
+Restore.Text = "◆  Universal Mount"
+Restore.TextColor3 = Color3.fromRGB(235,235,245)
+Restore.Font = Enum.Font.GothamBold
+Restore.TextSize = 11
+Restore.Visible = false
+Restore.Parent = Gui
+
+local restoreCorner = Instance.new("UICorner")
+restoreCorner.CornerRadius = UDim.new(0,9)
+restoreCorner.Parent = Restore
+
+connect(MinimizeButton.MouseButton1Click, function()
+    Window.Visible = false
+    Restore.Visible = true
+end)
+
+connect(Restore.MouseButton1Click, function()
+    Window.Visible = true
+    Restore.Visible = false
+end)
+
+--==============================================================
+-- Scroll area
+--==============================================================
+
+local Scroll = Instance.new("ScrollingFrame")
+Scroll.Size = UDim2.new(1, -16, 1, -52)
+Scroll.Position = UDim2.fromOffset(8, 47)
+Scroll.BackgroundTransparency = 1
+Scroll.BorderSizePixel = 0
+Scroll.ScrollBarThickness = 3
+Scroll.AutomaticCanvasSize = Enum.AutomaticSize.Y
+Scroll.CanvasSize = UDim2.fromOffset(0,0)
+Scroll.Parent = Window
+
+local MainLayout = Instance.new("UIListLayout")
+MainLayout.Padding = UDim.new(0,6)
+MainLayout.SortOrder = Enum.SortOrder.LayoutOrder
+MainLayout.Parent = Scroll
+
+local function section(name, open)
+    local holder = Instance.new("Frame")
+    holder.Size = UDim2.new(1,-4,0,0)
+    holder.AutomaticSize = Enum.AutomaticSize.Y
+    holder.BackgroundColor3 = Color3.fromRGB(23,23,31)
+    holder.Parent = Scroll
+
+    local corner = Instance.new("UICorner")
+    corner.CornerRadius = UDim.new(0,8)
+    corner.Parent = holder
+
+    local head = Instance.new("TextButton")
+    head.Size = UDim2.new(1,0,0,32)
+    head.BackgroundTransparency = 1
+    head.Text = (open and "▼  " or "▶  ") .. name
+    head.TextColor3 = Color3.fromRGB(220,220,232)
+    head.Font = Enum.Font.GothamBold
+    head.TextSize = 10
+    head.TextXAlignment = Enum.TextXAlignment.Left
+    head.Parent = holder
+
+    local content = Instance.new("Frame")
+    content.Size = UDim2.new(1,-10,0,0)
+    content.Position = UDim2.fromOffset(5,32)
+    content.BackgroundTransparency = 1
+    content.AutomaticSize = Enum.AutomaticSize.Y
+    content.Visible = open
+    content.Parent = holder
+
+    local list = Instance.new("UIListLayout")
+    list.Padding = UDim.new(0,5)
+    list.Parent = content
+
+    local pad = Instance.new("UIPadding")
+    pad.PaddingBottom = UDim.new(0,7)
+    pad.Parent = content
+
+    local expanded = open
+    connect(head.MouseButton1Click, function()
+        expanded = not expanded
+        content.Visible = expanded
+        head.Text = (expanded and "▼  " or "▶  ") .. name
+    end)
+
+    return content
+end
+
+local function button(parent, text, height)
+    local b = Instance.new("TextButton")
+    b.Size = UDim2.new(1,0,0,height or 34)
+    b.BackgroundColor3 = Color3.fromRGB(32,32,42)
+    b.Text = text
+    b.TextColor3 = Color3.fromRGB(230,230,240)
+    b.Font = Enum.Font.GothamMedium
+    b.TextSize = 10
+    b.TextTruncate = Enum.TextTruncate.AtEnd
+    b.Parent = parent
+
+    local c = Instance.new("UICorner")
+    c.CornerRadius = UDim.new(0,7)
+    c.Parent = b
+    return b
+end
+
+local function slider(parent, label, min, max, value, callback)
+    local holder = Instance.new("Frame")
+    holder.Size = UDim2.new(1,0,0,53)
+    holder.BackgroundColor3 = Color3.fromRGB(27,27,36)
+    holder.Parent = parent
+
+    local c = Instance.new("UICorner")
+    c.CornerRadius = UDim.new(0,7)
+    c.Parent = holder
+
+    local text = Instance.new("TextLabel")
+    text.Size = UDim2.new(1,-18,0,22)
+    text.Position = UDim2.fromOffset(9,2)
+    text.BackgroundTransparency = 1
+    text.TextColor3 = Color3.fromRGB(215,215,225)
+    text.Font = Enum.Font.GothamMedium
+    text.TextSize = 10
+    text.TextXAlignment = Enum.TextXAlignment.Left
+    text.Parent = holder
+
+    local bar = Instance.new("TextButton")
+    bar.Size = UDim2.new(1,-18,0,7)
+    bar.Position = UDim2.fromOffset(9,34)
+    bar.BackgroundColor3 = Color3.fromRGB(55,55,68)
+    bar.Text = ""
+    bar.AutoButtonColor = false
+    bar.Parent = holder
+
+    local fill = Instance.new("Frame")
+    fill.BorderSizePixel = 0
+    fill.BackgroundColor3 = Color3.fromRGB(115,115,245)
+    fill.Parent = bar
+
+    local fc = Instance.new("UICorner")
+    fc.CornerRadius = UDim.new(1,0)
+    fc.Parent = fill
+
+    local valueNow = value
+    local draggingSlider = false
+
+    local function set(v)
+        valueNow = math.clamp(v,min,max)
+        local alpha = (valueNow-min)/(max-min)
+        fill.Size = UDim2.new(alpha,0,1,0)
+        text.Text = string.format("%s  %.1f",label,valueNow)
+        callback(valueNow)
+    end
+
+    local function fromX(x)
+        local alpha = math.clamp((x-bar.AbsolutePosition.X)/bar.AbsoluteSize.X,0,1)
+        set(min+(max-min)*alpha)
+    end
+
+    connect(bar.MouseButton1Down,function(x)
+        draggingSlider=true
+        fromX(x)
+    end)
+
+    connect(UserInputService.InputChanged,function(input)
+        if not draggingSlider then return end
+        if input.UserInputType == Enum.UserInputType.MouseMovement then
+            fromX(input.Position.X)
+        end
+    end)
+
+    connect(UserInputService.InputEnded,function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1 then
+            draggingSlider=false
+        end
+    end)
+
+    set(value)
+end
+
+--==============================================================
+-- Target Picker
+--==============================================================
+
+local TargetContent = section("TARGET",true)
+local targetButton = button(TargetContent,"Select target...")
+local refreshButton = button(TargetContent,"↻  Refresh targets")
+
+local Picker = Instance.new("Frame")
+Picker.Size = UDim2.fromOffset(285,270)
+Picker.Position = UDim2.new(0,30,0.5,-135)
+Picker.BackgroundColor3 = Color3.fromRGB(20,20,27)
+Picker.Visible = false
+Picker.ZIndex = 100
+Picker.Parent = Gui
+
+local pickerCorner = Instance.new("UICorner")
+pickerCorner.CornerRadius = UDim.new(0,9)
+pickerCorner.Parent = Picker
+
+local pickerTitle = Instance.new("TextLabel")
+pickerTitle.Size = UDim2.new(1,-20,0,34)
+pickerTitle.Position = UDim2.fromOffset(10,3)
+pickerTitle.BackgroundTransparency = 1
+pickerTitle.Text = "SELECT TARGET"
+pickerTitle.TextColor3 = Color3.fromRGB(235,235,245)
+pickerTitle.Font = Enum.Font.GothamBold
+pickerTitle.TextSize = 11
+pickerTitle.TextXAlignment = Enum.TextXAlignment.Left
+pickerTitle.ZIndex = 101
+pickerTitle.Parent = Picker
+
+local pickerScroll = Instance.new("ScrollingFrame")
+pickerScroll.Size = UDim2.new(1,-16,1,-45)
+pickerScroll.Position = UDim2.fromOffset(8,39)
+pickerScroll.BackgroundTransparency = 1
+pickerScroll.BorderSizePixel = 0
+pickerScroll.ScrollBarThickness = 3
+pickerScroll.ZIndex = 101
+pickerScroll.Parent = Picker
+
+local pickerLayout = Instance.new("UIListLayout")
+pickerLayout.Padding = UDim.new(0,4)
+pickerLayout.Parent = pickerScroll
+
+local function rebuildPicker()
+    for _, child in ipairs(pickerScroll:GetChildren()) do
+        if child:IsA("TextButton") then child:Destroy() end
+    end
+
+    TargetService:Refresh()
+
+    for _, label in ipairs(TargetService.Labels) do
+        local b = Instance.new("TextButton")
+        b.Size = UDim2.new(1,-4,0,32)
+        b.BackgroundColor3 = Color3.fromRGB(32,32,42)
+        b.Text = label
+        b.TextColor3 = Color3.fromRGB(225,225,235)
+        b.Font = Enum.Font.Gotham
+        b.TextSize = 9
+        b.TextTruncate = Enum.TextTruncate.AtEnd
+        b.ZIndex = 102
+        b.Parent = pickerScroll
+
+        local c = Instance.new("UICorner")
+        c.CornerRadius = UDim.new(0,6)
+        c.Parent = b
+
+        b.MouseButton1Click:Connect(function()
+            if TargetService:Select(label) then
+                targetButton.Text = "Target  •  " .. label
+            end
+            Picker.Visible = false
+        end)
+    end
+
+    pickerScroll.CanvasSize = UDim2.fromOffset(0,#TargetService.Labels*36)
+end
+
+connect(targetButton.MouseButton1Click,function()
+    rebuildPicker()
+    Picker.Visible = true
+end)
+
+connect(refreshButton.MouseButton1Click,function()
+    rebuildPicker()
+end)
+
+--==============================================================
+-- Mount Controls
+--==============================================================
+
+local MountContent = section("MOUNT",true)
+slider(MountContent,"Distance",0.5,5,Config.Distance,function(v)
+    Config.Distance = math.round(v*10)/10
+end)
+
+slider(MountContent,"Height",-3,3,Config.Height,function(v)
+    Config.Height = math.round(v*10)/10
+end)
+
+local mountButton = button(MountContent,"●  Mount OFF")
+connect(mountButton.MouseButton1Click,function()
+    if MountService.Enabled then
+        MountService:Disable()
+        mountButton.Text = "●  Mount OFF"
+    else
+        if MountService:Enable() then
+            mountButton.Text = "●  Mount ON"
+        else
+            targetButton.Text = "Select a valid target first"
+        end
+    end
+end)
+
+--==============================================================
+-- Defense Controls
+--==============================================================
+
+local DefenseContent = section("DEFENSE",false)
+local safeButton = button(DefenseContent,"Safe Mode  OFF")
+local shieldButton = button(DefenseContent,"Auto Shield  OFF")
+local velocityButton = button(DefenseContent,"Velocity Stabilizer  ON")
+
+connect(safeButton.MouseButton1Click,function()
+    Config.SafeMode = not Config.SafeMode
+    safeButton.Text = "Safe Mode  " .. (Config.SafeMode and "ON" or "OFF")
+    if Config.SafeMode then
+        DefenseService:Enable()
+    elseif not MountService.Enabled and not Config.AutoShield then
+        DefenseService:Disable()
+    end
+end)
+
+connect(shieldButton.MouseButton1Click,function()
+    Config.AutoShield = not Config.AutoShield
+    shieldButton.Text = "Auto Shield  " .. (Config.AutoShield and "ON" or "OFF")
+    if Config.AutoShield then
+        DefenseService:Enable()
+    elseif not Config.SafeMode and not MountService.Enabled then
+        DefenseService:Disable()
+    end
+end)
+
+connect(velocityButton.MouseButton1Click,function()
+    Config.ZeroVelocity = not Config.ZeroVelocity
+    velocityButton.Text = "Velocity Stabilizer  " .. (Config.ZeroVelocity and "ON" or "OFF")
+end)
+
+--==============================================================
+-- Advanced Controls
+--==============================================================
+
+local AdvancedContent = section("ADVANCED",false)
+local remountButton = button(AdvancedContent,"Auto Remount  ON")
+local healthButton = button(AdvancedContent,"Local Health Lock  OFF")
+local resetButton = button(AdvancedContent,"Reset all mount state")
+
+connect(remountButton.MouseButton1Click,function()
+    Config.AutoRemount = not Config.AutoRemount
+    remountButton.Text = "Auto Remount  " .. (Config.AutoRemount and "ON" or "OFF")
+end)
+
+connect(healthButton.MouseButton1Click,function()
+    Config.HealthLock = not Config.HealthLock
+    healthButton.Text = "Local Health Lock  " .. (Config.HealthLock and "ON" or "OFF")
+end)
+
+connect(resetButton.MouseButton1Click,function()
+    MountService:Disable()
+    Config.SafeMode = false
+    Config.AutoShield = false
+    Config.HealthLock = false
+    safeButton.Text = "Safe Mode  OFF"
+    shieldButton.Text = "Auto Shield  OFF"
+    healthButton.Text = "Local Health Lock  OFF"
+    mountButton.Text = "●  Mount OFF"
+    DefenseService:Disable()
+end)
+
+--==============================================================
+-- Runtime Simulation
+--==============================================================
+
+connect(RunService.PreSimulation,function()
+    if MountService.Enabled then
+        MountService:Step()
+    end
+
+    if Config.SafeMode then
+        DefenseService:Enable()
+    end
+
+    if Config.AutoShield then
+        local localRoot = rootOf(LocalPlayer.Character)
+        local target = TargetService:Get()
+        local targetRoot = rootOf(target)
+
+        if localRoot and targetRoot then
+            if (localRoot.Position-targetRoot.Position).Magnitude <= Config.ShieldRadius then
+                DefenseService:Enable()
+                DefenseService:Step()
+            end
+        end
+    end
+
+    if Config.HealthLock then
+        local humanoid = humanoidOf(LocalPlayer.Character)
+        if humanoid and humanoid.Health > 0 then
+            humanoid.Health = humanoid.MaxHealth
+        end
+    end
+end)
+
+--==============================================================
+-- Respawn / Dynamic Target Events
+--==============================================================
+
+connect(Players.PlayerAdded,function()
+    task.defer(function()
+        TargetService:Refresh()
+    end)
+end)
+
+connect(Players.PlayerRemoving,function(player)
+    if TargetService.TrackedPlayer == player then
+        if Config.AutoRemount then
+            MountService:Disable()
+        end
+        TargetService:StopTracking()
+    end
+    task.defer(function()
+        TargetService:Refresh()
+    end)
+end)
+
+connect(Workspace.DescendantAdded,function(object)
+    if object:IsA("Model") then
+        task.defer(function()
+            TargetService:Refresh()
+        end)
+    end
+end)
+
+connect(Workspace.DescendantRemoving,function(object)
+    if object == TargetService.SelectedModel then
+        if Config.AutoRemount then
+            local player = Players:GetPlayerFromCharacter(object)
+            if player then
+                TargetService:TrackPlayer(player)
+            end
+        end
+    end
+end)
+
+connect(Players.PlayerAdded,function(player)
+    connect(player.CharacterAdded,function(character)
+        if player == TargetService.TrackedPlayer and Config.AutoRemount then
+            task.wait(0.35)
+            TargetService.SelectedModel = character
+            if MountService.Enabled then
+                DefenseService:Enable()
+            end
+        end
+    end)
+end)
+
+-- Existing players need respawn listeners too.
+for _, player in ipairs(Players:GetPlayers()) do
+    if player ~= LocalPlayer then
+        connect(player.CharacterAdded,function(character)
+            if player == TargetService.TrackedPlayer and Config.AutoRemount then
+                task.wait(0.35)
+                TargetService.SelectedModel = character
+                if MountService.Enabled then
+                    DefenseService:Enable()
+                end
+            end
+        end)
+    end
+end
+
+connect(LocalPlayer.CharacterAdded,function()
+    task.wait(0.35)
+    if MountService.Enabled or Config.SafeMode or Config.AutoShield then
+        DefenseService:Enable()
+    end
+end)
+
+--==============================================================
+-- Close / Cleanup
+--==============================================================
+
+local destroyed = false
+
+local function destroySystem()
+    if destroyed then return end
+    destroyed = true
+
+    MountService:Disable()
+    DefenseService:Disable()
+    TargetService:StopTracking()
+    disconnectAll()
+
+    if Gui and Gui.Parent then
+        Gui:Destroy()
+    end
+end
+
+connect(CloseButton.MouseButton1Click,destroySystem)
+
+--==============================================================
+-- Status Refresh
+--==============================================================
+
+connect(RunService.Heartbeat,function()
+    if destroyed then return end
+
+    local target = TargetService:Get()
+    if target then
+        targetButton.Text = "Target  •  " .. target.Name
+    elseif not Picker.Visible then
+        targetButton.Text = "Select target..."
+    end
+
+    if MountService.Enabled then
+        mountButton.Text = "●  Mount ON"
+    else
+        mountButton.Text = "●  Mount OFF"
+    end
+end)
+
+--==============================================================
+-- Initial State
+--==============================================================
+
+TargetService:Refresh()
+
+_G.UniversalMountPro = {
+    Config = Config,
+    Targets = TargetService,
+    Mount = MountService,
+    Defense = DefenseService,
+    Destroy = destroySystem,
+}
+
+print("[UniversalMount PRO V3] Ready — Studio/private experience utility.")
