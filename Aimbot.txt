@@ -1,0 +1,445 @@
+--[[
+    Lunar's Roblox Combat Suite
+    Executor: Synapse / Script-Ware / Krnl / Fluxus (client-side)
+    Features: Aimbot, Silent Aim, Bhop, ESP (Box/Name/Health/Distance), Skeleton
+    Toggle UI: RightShift
+--]]
+
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
+local Workspace = game:GetService("Workspace")
+local Camera = Workspace.CurrentCamera
+local LocalPlayer = Players.LocalPlayer
+local Mouse = LocalPlayer:GetMouse()
+
+-- ============ CONFIG ============
+local Config = {
+    Aimbot = {
+        Enabled = false,
+        Key = Enum.UserInputType.MouseButton2,
+        TeamCheck = true,
+        WallCheck = false,
+        FOV = 120,
+        Smoothness = 0.25,
+        Part = "Head",
+    },
+    SilentAim = {
+        Enabled = false,
+        Key = Enum.UserInputType.MouseButton1,
+        TeamCheck = true,
+        WallCheck = false,
+        FOV = 200,
+        HitPart = "Head",
+    },
+    Bhop = {
+        Enabled = false,
+        Key = Enum.KeyCode.Space,
+    },
+    ESP = {
+        Enabled = true,
+        Box = true,
+        Name = true,
+        Health = true,
+        Distance = true,
+        Skeleton = true,
+        TeamCheck = true,
+        MaxDistance = 1000,
+        Color = Color3.fromRGB(0, 255, 170),
+        TeamColor = Color3.fromRGB(255, 80, 80),
+    },
+}
+
+-- ============ SERVICES / HELPERS ============
+local function isAlive(plr)
+    local char = plr.Character
+    if not char then return false end
+    local hum = char:FindFirstChildOfClass("Humanoid")
+    return hum and hum.Health > 0
+end
+
+local function getRoot(plr)
+    local char = plr.Character
+    return char and char:FindFirstChild("HumanoidRootPart")
+end
+
+local function getHead(plr)
+    local char = plr.Character
+    return char and char:FindFirstChild("Head")
+end
+
+local function isTeammate(plr)
+    if plr == LocalPlayer then return true end
+    if not Config.ESP.TeamCheck and not Config.Aimbot.TeamCheck then return false end
+    return plr.Team == LocalPlayer.Team
+end
+
+local function isVisible(part)
+    if not Config.Aimbot.WallCheck and not Config.SilentAim.WallCheck then return true end
+    local origin = Camera.CFrame.Position
+    local dir = (part.Position - origin)
+    local ray = Ray.new(origin, dir)
+    local hit = Workspace:FindPartOnRayWithIgnoreList(ray, {LocalPlayer.Character, part.Parent})
+    return hit == nil
+end
+
+-- ============ AIMBOT ============
+local function getClosestPlayer(fov, teamCheck, partName)
+    local closest, shortest = nil, fov
+    local screenCenter = Vector2.new(Camera.ViewportSize.X / 2, Camera.ViewportSize.Y / 2)
+
+    for _, plr in ipairs(Players:GetPlayers()) do
+        if plr == LocalPlayer then continue end
+        if not isAlive(plr) then continue end
+        if teamCheck and plr.Team == LocalPlayer.Team then continue end
+
+        local part = plr.Character:FindFirstChild(partName) or getHead(plr)
+        if not part then continue end
+
+        local screenPos, onScreen = Camera:WorldToViewportPoint(part.Position)
+        if not onScreen then continue end
+
+        local dist = (Vector2.new(screenPos.X, screenPos.Y) - screenCenter).Magnitude
+        if dist < shortest then
+            if not isVisible(part) then continue end
+            shortest = dist
+            closest = plr
+        end
+    end
+    return closest
+end
+
+local aimbotHeld = false
+UserInputService.InputBegan:Connect(function(input, gp)
+    if gp then return end
+    if input.UserInputType == Config.Aimbot.Key then aimbotHeld = true end
+end)
+UserInputService.InputEnded:Connect(function(input)
+    if input.UserInputType == Config.Aimbot.Key then aimbotHeld = false end
+end)
+
+RunService.RenderStepped:Connect(function()
+    if not Config.Aimbot.Enabled or not aimbotHeld then return end
+    local target = getClosestPlayer(Config.Aimbot.FOV, Config.Aimbot.TeamCheck, Config.Aimbot.Part)
+    if not target then return end
+    local part = target.Character:FindFirstChild(Config.Aimbot.Part) or getHead(target)
+    if not part then return end
+
+    local desired = CFrame.new(Camera.CFrame.Position, part.Position)
+    Camera.CFrame = Camera.CFrame:Lerp(desired, 1 - Config.Aimbot.Smoothness)
+end)
+
+-- ============ SILENT AIM (hook via mouse hit) ============
+local oldNamecall
+oldNamecall = hookmetamethod(game, "__namecall", function(self, ...)
+    local method = getnamecallmethod()
+    local args = {...}
+
+    if Config.SilentAim.Enabled and not checkcaller() then
+        if method == "FindPartOnRayWithIgnoreList" or method == "FindPartOnRay" then
+            local target = getClosestPlayer(Config.SilentAim.FOV, Config.SilentAim.TeamCheck, Config.SilentAim.HitPart)
+            if target then
+                local hitPart = target.Character:FindFirstChild(Config.SilentAim.HitPart) or getHead(target)
+                if hitPart then
+                    local origin = args[2] and args[2].Origin or (args[1] and args[1].Origin)
+                    local newRay = Ray.new(origin or Camera.CFrame.Position, (hitPart.Position - (origin or Camera.CFrame.Position)))
+                    if method == "FindPartOnRay" then
+                        args[1] = newRay
+                    elseif method == "FindPartOnRayWithIgnoreList" then
+                        args[1] = newRay
+                    end
+                    return oldNamecall(self, unpack(args))
+                end
+            end
+        end
+    end
+    return oldNamecall(self, ...)
+end)
+
+-- ============ BUNNY HOP ============
+local bhopHeld = false
+UserInputService.InputBegan:Connect(function(input, gp)
+    if gp then return end
+    if input.KeyCode == Config.Bhop.Key then bhopHeld = true end
+end)
+UserInputService.InputEnded:Connect(function(input)
+    if input.KeyCode == Config.Bhop.Key then bhopHeld = false end
+end)
+
+RunService.Heartbeat:Connect(function()
+    if not Config.Bhop.Enabled or not bhopHeld then return end
+    local char = LocalPlayer.Character
+    if not char then return end
+    local hum = char:FindFirstChildOfClass("Humanoid")
+    if not hum then return end
+    if hum.FloorMaterial ~= Enum.Material.Air then
+        hum.Jump = true
+    end
+end)
+
+-- ============ ESP ============
+local espFolder = Instance.new("Folder", game:GetService("CoreGui"))
+espFolder.Name = "LunarESP"
+
+local drawings = {}
+
+local function createDrawing(class, props)
+    local d = Drawing.new(class)
+    for k, v in pairs(props) do d[k] = v end
+    return d
+end
+
+local function createESP(plr)
+    local data = {
+        box = createDrawing("Square", {Thickness = 1, Filled = false, Visible = false}),
+        name = createDrawing("Text", {Size = 14, Center = true, Outline = true, Visible = false}),
+        healthBg = createDrawing("Square", {Thickness = 1, Filled = true, Color = Color3.new(0,0,0), Visible = false}),
+        healthBar = createDrawing("Square", {Thickness = 1, Filled = true, Color = Color3.fromRGB(0,255,0), Visible = false}),
+        dist = createDrawing("Text", {Size = 12, Center = true, Outline = true, Visible = false}),
+        skeleton = {},
+    }
+    for i = 1, 20 do
+        data.skeleton[i] = createDrawing("Line", {Thickness = 1, Visible = false})
+    end
+    drawings[plr] = data
+end
+
+local function removeESP(plr)
+    local data = drawings[plr]
+    if not data then return end
+    for _, d in pairs(data) do
+        if type(d) == "table" then
+            for _, l in pairs(d) do l:Remove() end
+        else
+            d:Remove()
+        end
+    end
+    drawings[plr] = nil
+end
+
+Players.PlayerAdded:Connect(createESP)
+for _, plr in ipairs(Players:GetPlayers()) do
+    if plr ~= LocalPlayer then createESP(plr) end
+end
+Players.PlayerRemoving:Connect(removeESP)
+
+-- Skeleton connections
+local SKELETON = {
+    {"Head","UpperTorso"},{"UpperTorso","LowerTorso"},
+    {"UpperTorso","LeftUpperArm"},{"LeftUpperArm","LeftLowerArm"},{"LeftLowerArm","LeftHand"},
+    {"UpperTorso","RightUpperArm"},{"RightUpperArm","RightLowerArm"},{"RightLowerArm","RightHand"},
+    {"LowerTorso","LeftUpperLeg"},{"LeftUpperLeg","LeftLowerLeg"},{"LeftLowerLeg","LeftFoot"},
+    {"LowerTorso","RightUpperLeg"},{"RightUpperLeg","RightLowerLeg"},{"RightLowerLeg","RightFoot"},
+}
+
+RunService.RenderStepped:Connect(function()
+    for plr, data in pairs(drawings) do
+        local char = plr.Character
+        local hum = char and char:FindFirstChildOfClass("Humanoid")
+        local root = char and char:FindFirstChild("HumanoidRootPart")
+        local head = char and char:FindFirstChild("Head")
+
+        if not (Config.ESP.Enabled and char and hum and hum.Health > 0 and root and head) then
+            for _, d in pairs(data) do
+                if type(d) == "table" then
+                    for _, l in pairs(d) do l.Visible = false end
+                else
+                    d.Visible = false
+                end
+            end
+            continue
+        end
+
+        local dist = (Camera.CFrame.Position - root.Position).Magnitude
+        if dist > Config.ESP.MaxDistance then
+            for _, d in pairs(data) do
+                if type(d) == "table" then
+                    for _, l in pairs(d) do l.Visible = false end
+                else
+                    d.Visible = false
+                end
+            end
+            continue
+        end
+
+        local team = Config.ESP.TeamCheck and plr.Team == LocalPlayer.Team
+        local color = team and Config.ESP.TeamColor or Config.ESP.Color
+
+        local hrpPos, onScreen = Camera:WorldToViewportPoint(root.Position)
+        if not onScreen then
+            for _, d in pairs(data) do
+                if type(d) == "table" then
+                    for _, l in pairs(d) do l.Visible = false end
+                else
+                    d.Visible = false
+                end
+            end
+            continue
+        end
+
+        -- Box
+        if Config.ESP.Box then
+            local topPos = Camera:WorldToViewportPoint(root.Position + Vector3.new(0, 3, 0))
+            local bottomPos = Camera:WorldToViewportPoint(root.Position - Vector3.new(0, 3, 0))
+            local height = math.abs(topPos.Y - bottomPos.Y)
+            local width = height / 2
+
+            data.box.Size = Vector2.new(width, height)
+            data.box.Position = Vector2.new(hrpPos.X - width/2, hrpPos.Y - height/2)
+            data.box.Color = color
+            data.box.Visible = true
+        else
+            data.box.Visible = false
+        end
+
+        -- Name
+        if Config.ESP.Name then
+            data.name.Text = plr.Name
+            data.name.Position = Vector2.new(hrpPos.X, hrpPos.Y - 60)
+            data.name.Color = color
+            data.name.Visible = true
+        else
+            data.name.Visible = false
+        end
+
+        -- Health bar
+        if Config.ESP.Health then
+            local hp = math.clamp(hum.Health / hum.MaxHealth, 0, 1)
+            local boxPos = data.box.Position
+            local boxSize = data.box.Size
+            data.healthBg.Size = Vector2.new(3, boxSize.Y)
+            data.healthBg.Position = Vector2.new(boxPos.X - 6, boxPos.Y)
+            data.healthBg.Visible = true
+
+            data.healthBar.Size = Vector2.new(3, boxSize.Y * hp)
+            data.healthBar.Position = Vector2.new(boxPos.X - 6, boxPos.Y + boxSize.Y * (1 - hp))
+            data.healthBar.Color = Color3.fromRGB(255 * (1-hp), 255 * hp, 0)
+            data.healthBar.Visible = true
+        else
+            data.healthBg.Visible = false
+            data.healthBar.Visible = false
+        end
+
+        -- Distance
+        if Config.ESP.Distance then
+            data.dist.Text = string.format("[%d]", math.floor(dist))
+            data.dist.Position = Vector2.new(hrpPos.X, hrpPos.Y + 65)
+            data.dist.Color = color
+            data.dist.Visible = true
+        else
+            data.dist.Visible = false
+        end
+
+        -- Skeleton
+        if Config.ESP.Skeleton then
+            for i, pair in ipairs(SKELETON) do
+                local a = char:FindFirstChild(pair[1])
+                local b = char:FindFirstChild(pair[2])
+                local line = data.skeleton[i]
+                if a and b then
+                    local aPos, aOn = Camera:WorldToViewportPoint(a.Position)
+                    local bPos, bOn = Camera:WorldToViewportPoint(b.Position)
+                    if aOn and bOn then
+                        line.From = Vector2.new(aPos.X, aPos.Y)
+                        line.To = Vector2.new(bPos.X, bPos.Y)
+                        line.Color = color
+                        line.Visible = true
+                    else
+                        line.Visible = false
+                    end
+                else
+                    line.Visible = false
+                end
+            end
+        else
+            for _, line in pairs(data.skeleton) do line.Visible = false end
+        end
+    end
+end)
+
+-- ============ UI (Draggable) ============
+local gui = Instance.new("ScreenGui")
+gui.Name = "LunarUI"
+gui.ResetOnSpawn = false
+gui.Parent = game:GetService("CoreGui")
+
+local frame = Instance.new("Frame", gui)
+frame.Size = UDim2.new(0, 260, 0, 340)
+frame.Position = UDim2.new(0, 20, 0, 100)
+frame.BackgroundColor3 = Color3.fromRGB(15, 15, 20)
+frame.BorderSizePixel = 0
+frame.Active = true
+frame.Draggable = true
+
+local corner = Instance.new("UICorner", frame)
+corner.CornerRadius = UDim.new(0, 8)
+
+local title = Instance.new("TextLabel", frame)
+title.Size = UDim2.new(1, 0, 0, 30)
+title.BackgroundColor3 = Color3.fromRGB(25, 25, 32)
+title.Text = "Lunar | Combat Suite"
+title.TextColor3 = Color3.fromRGB(0, 255, 170)
+title.Font = Enum.Font.GothamBold
+title.TextSize = 14
+title.BorderSizePixel = 0
+
+local titleCorner = Instance.new("UICorner", title)
+titleCorner.CornerRadius = UDim.new(0, 8)
+
+local scroll = Instance.new("ScrollingFrame", frame)
+scroll.Size = UDim2.new(1, -10, 1, -40)
+scroll.Position = UDim2.new(0, 5, 0, 35)
+scroll.BackgroundTransparency = 1
+scroll.BorderSizePixel = 0
+scroll.ScrollBarThickness = 3
+scroll.CanvasSize = UDim2.new(0, 0, 0, 400)
+
+local y = 0
+local function addToggle(name, getter, setter)
+    local btn = Instance.new("TextButton", scroll)
+    btn.Size = UDim2.new(1, 0, 0, 26)
+    btn.Position = UDim2.new(0, 0, 0, y)
+    btn.BackgroundColor3 = Color3.fromRGB(25, 25, 32)
+    btn.TextColor3 = getter() and Color3.fromRGB(0, 255, 170) or Color3.fromRGB(180, 180, 180)
+    btn.Text = (getter() and "[+] " or "[-] ") .. name
+    btn.Font = Enum.Font.Gotham
+    btn.TextSize = 12
+    btn.BorderSizePixel = 0
+    btn.MouseButton1Click:Connect(function()
+        setter(not getter())
+        btn.Text = (getter() and "[+] " or "[-] ") .. name
+        btn.TextColor3 = getter() and Color3.fromRGB(0, 255, 170) or Color3.fromRGB(180, 180, 180)
+    end)
+    y = y + 28
+end
+
+addToggle("Aimbot", function() return Config.Aimbot.Enabled end, function(v) Config.Aimbot.Enabled = v end)
+addToggle("Silent Aim", function() return Config.SilentAim.Enabled end, function(v) Config.SilentAim.Enabled = v end)
+addToggle("Bunny Hop", function() return Config.Bhop.Enabled end, function(v) Config.Bhop.Enabled = v end)
+addToggle("ESP Master", function() return Config.ESP.Enabled end, function(v) Config.ESP.Enabled = v end)
+addToggle("  Box", function() return Config.ESP.Box end, function(v) Config.ESP.Box = v end)
+addToggle("  Name", function() return Config.ESP.Name end, function(v) Config.ESP.Name = v end)
+addToggle("  Health", function() return Config.ESP.Health end, function(v) Config.ESP.Health = v end)
+addToggle("  Distance", function() return Config.ESP.Distance end, function(v) Config.ESP.Distance = v end)
+addToggle("  Skeleton", function() return Config.ESP.Skeleton end, function(v) Config.ESP.Skeleton = v end)
+addToggle("Team Check", function() return Config.ESP.TeamCheck end, function(v)
+    Config.ESP.TeamCheck = v
+    Config.Aimbot.TeamCheck = v
+    Config.SilentAim.TeamCheck = v
+end)
+addToggle("Wall Check", function() return Config.Aimbot.WallCheck end, function(v)
+    Config.Aimbot.WallCheck = v
+    Config.SilentAim.WallCheck = v
+end)
+
+scroll.CanvasSize = UDim2.new(0, 0, 0, y)
+
+-- Toggle UI
+UserInputService.InputBegan:Connect(function(input, gp)
+    if gp then return end
+    if input.KeyCode == Enum.KeyCode.RightShift then
+        frame.Visible = not frame.Visible
+    end
+end)
+
+print("[Lunar] Combat Suite loaded. RightShift to toggle UI.")
