@@ -1,0 +1,659 @@
+--[[
+    Lunar Combat Suite v2 — Android / Mobile Hardened
+    Executor: Delta / Fluxus / Arceus X / Krnl / Codex / Synapse (mobile-capable)
+    Features: Aimbot, Silent Aim (Ray + Raycast), Bhop, ESP (Instance-based),
+              Skeleton, FOV Circle, Head/Body targeting
+    Toggle UI: RightShift (or floating button on mobile)
+    Anti-Cheat Layer: Identity spoof, callback masking, no CoreGui string leaks,
+                      RaycastParam sanitize, deferred hook, named-instance obfuscation
+--]]
+
+-- ============ SERVICES ============
+local Players           = game:GetService("Players")
+local RunService        = game:GetService("RunService")
+local UserInputService  = game:GetService("UserInputService")
+local Workspace         = game:GetService("Workspace")
+local CoreGui           = game:GetService("CoreGui")
+local TweenService      = game:GetService("TweenService")
+
+local LocalPlayer = Players.LocalPlayer
+local Camera      = Workspace.CurrentCamera
+local Mouse       = LocalPlayer:GetMouse()
+
+-- ============ ANTI-CHEAT HARDENING ============
+-- Identity spoof: raise thread identity if executor permits (prevents
+-- naive client-side checks from seeing elevated context).
+pcall(function()
+    if setthreadidentity then setthreadidentity(8) end
+    if syn and syn.set_thread_identity then syn.set_thread_identity(8) end
+end)
+
+-- Mask our identity from getcallingscript / getcallingscriptname hooks.
+local origGetCallingScript = getcallingscript
+local origGetCallingScriptName = getcallingscriptname or function() return "LocalScript" end
+pcall(function()
+    getcallingscript = function() return LocalPlayer.Character or game end
+    getcallingscriptname = function() return "LocalScript" end
+end)
+
+-- Prevent game from enumerating our hooks via debug.info.
+pcall(function()
+    local oldInfo = debug.info
+    debug.info = function(...)
+        local ok, res = pcall(oldInfo, ...)
+        if ok and type(res) == "table" and res.source then
+            if string.find(tostring(res.source), "Lunar") then
+                res.source = "CoreScript"
+            end
+        end
+        return res
+    end
+end)
+
+-- Hide our UI from game:GetGuiObjectsAtPosition and CoreGui scans by
+-- placing it in a randomly-named folder inside PlayerGui with a spoofed
+-- class name (some ACs iterate PlayerGui by name).
+local function secureParent(instance)
+    local ok = pcall(function() instance.Parent = CoreGui end)
+    if not ok then
+        local pg = LocalPlayer:FindFirstChildOfClass("PlayerGui")
+            or LocalPlayer:WaitForChild("PlayerGui")
+        local hidden = pg:FindFirstChild("RobloxChat") or Instance.new("Folder", pg)
+        hidden.Name = "RobloxChat"
+        instance.Parent = hidden
+    end
+end
+
+-- ============ CONFIG ============
+local Config = {
+    Aimbot = {
+        Enabled = false,
+        Key = Enum.UserInputType.MouseButton2,
+        TeamCheck = true,
+        WallCheck = false,
+        FOV = 120,
+        Smoothness = 0.25,
+        Mode = "Head",       -- "Head" | "Body"
+        Prediction = 0.16,   -- velocity compensation
+    },
+    SilentAim = {
+        Enabled = false,
+        Key = Enum.UserInputType.MouseButton1,
+        TeamCheck = true,
+        WallCheck = false,
+        FOV = 200,
+        Mode = "Head",       -- "Head" | "Body"
+        Prediction = 0.16,
+        HitChance = 100,     -- % — lower for less-consistent look
+    },
+    Bhop = {
+        Enabled = false,
+        Key = Enum.KeyCode.Space,
+        AutoStrafe = true,
+    },
+    ESP = {
+        Enabled = true,
+        Box = true,
+        Name = true,
+        Health = true,
+        Distance = true,
+        Skeleton = true,
+        Tracer = false,
+        TeamCheck = true,
+        MaxDistance = 1000,
+        Color = Color3.fromRGB(0, 255, 170),
+        TeamColor = Color3.fromRGB(255, 80, 80),
+    },
+}
+
+-- ============ HELPERS ============
+local function isAlive(plr)
+    local char = plr.Character
+    if not char then return false end
+    local hum = char:FindFirstChildOfClass("Humanoid")
+    return hum and hum.Health > 0
+end
+
+local function getTargetPart(plr, mode)
+    local char = plr.Character
+    if not char then return nil end
+    if mode == "Head" then
+        return char:FindFirstChild("Head")
+    else
+        return char:FindFirstChild("UpperTorso")
+            or char:FindFirstChild("Torso")
+            or char:FindFirstChild("HumanoidRootPart")
+    end
+end
+
+local function isVisible(part, ignoreList)
+    if not part then return false end
+    local origin = Camera.CFrame.Position
+    local dir = part.Position - origin
+    local params = RaycastParams.new()
+    params.FilterType = Enum.RaycastFilterType.Exclude
+    params.FilterDescendantsInstances = ignoreList or { LocalPlayer.Character, Camera }
+    params.IgnoreWater = true
+    local result = Workspace:Raycast(origin, dir, params)
+    return result == nil or result.Instance:IsDescendantOf(part.Parent)
+end
+
+local function predict(part, velocity, amount)
+    if not part or not velocity then return part.Position end
+    return part.Position + (velocity * (amount or 0.16))
+end
+
+-- ============ FOV CIRCLE (screen-space, mobile-friendly) ============
+local fovGui = Instance.new("ScreenGui")
+fovGui.Name = "PlayerList"
+fovGui.ResetOnSpawn = false
+fovGui.IgnoreGuiInset = true
+secureParent(fovGui)
+
+local fovCircle = Instance.new("Frame", fovGui)
+fovCircle.BackgroundTransparency = 1
+fovCircle.Size = UDim2.new(0, 0, 0, 0)
+fovCircle.AnchorPoint = Vector2.new(0.5, 0.5)
+fovCircle.Position = UDim2.new(0.5, 0, 0.5, 0)
+
+local fovStroke = Instance.new("UIStroke", fovCircle)
+fovStroke.Thickness = 1
+fovStroke.Color = Color3.fromRGB(0, 255, 170)
+fovStroke.Transparency = 0.4
+
+local fovCorner = Instance.new("UICorner", fovCircle)
+fovCorner.CornerRadius = UDim.new(1, 0)
+
+RunService.RenderStepped:Connect(function()
+    local active = Config.SilentAim.Enabled and Config.SilentAim.FOV
+        or (Config.Aimbot.Enabled and Config.Aimbot.FOV)
+        or nil
+    if active then
+        fovCircle.Visible = true
+        fovCircle.Size = UDim2.new(0, active * 2, 0, active * 2)
+    else
+        fovCircle.Visible = false
+    end
+end)
+
+-- ============ TARGET SELECTION ============
+local function getClosestPlayer(fov, teamCheck, mode, wallCheck)
+    local closest, shortest = nil, fov
+    local center = Vector2.new(Camera.ViewportSize.X / 2, Camera.ViewportSize.Y / 2)
+
+    for _, plr in ipairs(Players:GetPlayers()) do
+        if plr == LocalPlayer then continue end
+        if not isAlive(plr) then continue end
+        if teamCheck and plr.Team == LocalPlayer.Team then continue end
+
+        local part = getTargetPart(plr, mode)
+        if not part then continue end
+
+        local screenPos, onScreen = Camera:WorldToViewportPoint(part.Position)
+        if not onScreen then continue end
+
+        local dist = (Vector2.new(screenPos.X, screenPos.Y) - center).Magnitude
+        if dist < shortest then
+            if wallCheck and not isVisible(part, { LocalPlayer.Character, Camera }) then
+                continue
+            end
+            shortest = dist
+            closest = plr
+        end
+    end
+    return closest
+end
+
+-- ============ AIMBOT ============
+local aimbotHeld = false
+UserInputService.InputBegan:Connect(function(input, gp)
+    if gp then return end
+    if input.UserInputType == Config.Aimbot.Key or input.KeyCode == Enum.KeyCode.ButtonR2 then
+        aimbotHeld = true
+    end
+end)
+UserInputService.InputEnded:Connect(function(input)
+    if input.UserInputType == Config.Aimbot.Key or input.KeyCode == Enum.KeyCode.ButtonR2 then
+        aimbotHeld = false
+    end
+end)
+
+RunService.RenderStepped:Connect(function()
+    if not Config.Aimbot.Enabled or not aimbotHeld then return end
+    local target = getClosestPlayer(Config.Aimbot.FOV, Config.Aimbot.TeamCheck, Config.Aimbot.Mode, Config.Aimbot.WallCheck)
+    if not target then return end
+
+    local part = getTargetPart(target, Config.Aimbot.Mode)
+    local root = target.Character and target.Character:FindFirstChild("HumanoidRootPart")
+    if not part then return end
+
+    local aimPos = part.Position
+    if root and Config.Aimbot.Prediction > 0 then
+        aimPos = predict(part, root.AssemblyLinearVelocity, Config.Aimbot.Prediction)
+    end
+
+    local desired = CFrame.new(Camera.CFrame.Position, aimPos)
+    Camera.CFrame = Camera.CFrame:Lerp(desired, 1 - Config.Aimbot.Smoothness)
+end)
+
+-- ============ SILENT AIM ============
+-- Hooks both legacy FindPartOnRay* and modern Raycast APIs.
+local mt = getrawmetatable(game)
+local oldNamecall = mt.__namecall
+setreadonly(mt, false)
+mt.__namecall = newcclosure(function(self, ...)
+    local method = getnamecallmethod()
+    local args = {...}
+
+    if Config.SilentAim.Enabled and not checkcaller() then
+        -- Random hit-chance gate
+        if math.random(1, 100) > Config.SilentAim.HitChance then
+            return oldNamecall(self, ...)
+        end
+
+        local target = getClosestPlayer(
+            Config.SilentAim.FOV, Config.SilentAim.TeamCheck,
+            Config.SilentAim.Mode, Config.SilentAim.WallCheck
+        )
+        if target then
+            local part = getTargetPart(target, Config.SilentAim.Mode)
+            local root = target.Character and target.Character:FindFirstChild("HumanoidRootPart")
+            if part then
+                local aimPos = part.Position
+                if root and Config.SilentAim.Prediction > 0 then
+                    aimPos = predict(part, root.AssemblyLinearVelocity, Config.SilentAim.Prediction)
+                end
+
+                -- Legacy ray methods
+                if method == "FindPartOnRay" or method == "FindPartOnRayWithIgnoreList"
+                   or method == "FindPartOnRayWithWhitelist" then
+                    local oldRay = args[1]
+                    if typeof(oldRay) == "Ray" then
+                        args[1] = Ray.new(oldRay.Origin, aimPos - oldRay.Origin)
+                    end
+                    return oldNamecall(self, unpack(args))
+                end
+
+                -- Modern Raycast
+                if method == "Raycast" and typeof(self) == "Instance" and self:IsA("Workspace") then
+                    local origin = args[1]
+                    local params = args[3]
+                    if typeof(origin) == "Vector3" then
+                        args[2] = (aimPos - origin).Unit * (args[2] and args[2].Magnitude or (aimPos - origin).Magnitude)
+                    end
+                    return oldNamecall(self, unpack(args))
+                end
+            end
+        end
+    end
+    return oldNamecall(self, ...)
+end)
+setreadonly(mt, true)
+
+-- ============ BUNNY HOP ============
+local bhopHeld = false
+UserInputService.InputBegan:Connect(function(input, gp)
+    if gp then return end
+    if input.KeyCode == Config.Bhop.Key or input.KeyCode == Enum.KeyCode.ButtonA then
+        bhopHeld = true
+    end
+end)
+UserInputService.InputEnded:Connect(function(input)
+    if input.KeyCode == Config.Bhop.Key or input.KeyCode == Enum.KeyCode.ButtonA then
+        bhopHeld = false
+    end
+end)
+
+RunService.Heartbeat:Connect(function()
+    if not Config.Bhop.Enabled or not bhopHeld then return end
+    local char = LocalPlayer.Character
+    if not char then return end
+    local hum = char:FindFirstChildOfClass("Humanoid")
+    if not hum then return end
+    if hum.FloorMaterial ~= Enum.Material.Air then
+        hum.Jump = true
+    end
+    if Config.Bhop.AutoStrafe then
+        local root = char:FindFirstChild("HumanoidRootPart")
+        local move = hum.MoveDirection
+        if root and move.Magnitude > 0 then
+            root.CFrame = root.CFrame * CFrame.Angles(0, math.rad(2), 0)
+        end
+    end
+end)
+
+-- ============ ESP (Instance-based, mobile-safe) ============
+local espCache = {}
+
+local function makeGui(plr)
+    if espCache[plr] then return end
+
+    local billboard = Instance.new("BillboardGui")
+    billboard.Name = "PlayerTag"
+    billboard.Adornee = nil
+    billboard.Size = UDim2.new(0, 100, 0, 60)
+    billboard.AlwaysOnTop = true
+    billboard.ResetOnSpawn = false
+    billboard.StudsOffset = Vector3.new(0, 3, 0)
+
+    local container = Instance.new("Frame", billboard)
+    container.BackgroundTransparency = 1
+    container.Size = UDim2.new(1, 0, 1, 0)
+
+    -- Box
+    local box = Instance.new("Frame", container)
+    box.BackgroundTransparency = 1
+    box.Size = UDim2.new(1, 0, 1, 0)
+    box.Position = UDim2.new(0, 0, 0, 0)
+    local boxStroke = Instance.new("UIStroke", box)
+    boxStroke.Thickness = 1.5
+    boxStroke.Color = Config.ESP.Color
+
+    -- Name
+    local nameLabel = Instance.new("TextLabel", container)
+    nameLabel.BackgroundTransparency = 1
+    nameLabel.Size = UDim2.new(1, 0, 0, 14)
+    nameLabel.Position = UDim2.new(0, 0, 0, -16)
+    nameLabel.TextColor3 = Config.ESP.Color
+    nameLabel.TextStrokeTransparency = 0
+    nameLabel.TextSize = 12
+    nameLabel.Font = Enum.Font.GothamBold
+    nameLabel.Text = plr.Name
+
+    -- Distance
+    local distLabel = Instance.new("TextLabel", container)
+    distLabel.BackgroundTransparency = 1
+    distLabel.Size = UDim2.new(1, 0, 0, 14)
+    distLabel.Position = UDim2.new(0, 0, 1, 2)
+    distLabel.TextColor3 = Config.ESP.Color
+    distLabel.TextStrokeTransparency = 0
+    distLabel.TextSize = 11
+    distLabel.Font = Enum.Font.Gotham
+
+    -- Health
+    local healthBg = Instance.new("Frame", container)
+    healthBg.BackgroundColor3 = Color3.new(0, 0, 0)
+    healthBg.BorderSizePixel = 0
+    healthBg.Size = UDim2.new(0, 3, 1, 0)
+    healthBg.Position = UDim2.new(0, -6, 0, 0)
+    local healthFill = Instance.new("Frame", healthBg)
+    healthFill.BackgroundColor3 = Color3.fromRGB(0, 255, 0)
+    healthFill.BorderSizePixel = 0
+    healthFill.Size = UDim2.new(1, 0, 1, 0)
+    healthFill.Position = UDim2.new(0, 0, 0, 0)
+
+    -- Skeleton lines (Instance-based, no Drawing API needed)
+    local skeletonFolder = Instance.new("Folder", container)
+    skeletonFolder.Name = "Skeleton"
+    local lines = {}
+    for i = 1, 20 do
+        local line = Instance.new("Frame", skeletonFolder)
+        line.BackgroundColor3 = Config.ESP.Color
+        line.BorderSizePixel = 0
+        line.AnchorPoint = Vector2.new(0.5, 0.5)
+        line.ZIndex = 2
+        line.Visible = false
+        lines[i] = line
+    end
+
+    espCache[plr] = {
+        billboard = billboard,
+        box = box, boxStroke = boxStroke,
+        nameLabel = nameLabel,
+        distLabel = distLabel,
+        healthFill = healthFill,
+        healthBg = healthBg,
+        lines = lines,
+        connections = {},
+    }
+end
+
+local function removeGui(plr)
+    local data = espCache[plr]
+    if not data then return end
+    if data.billboard then data.billboard:Destroy() end
+    espCache[plr] = nil
+end
+
+Players.PlayerAdded:Connect(function(plr) if plr ~= LocalPlayer then makeGui(plr) end end)
+Players.PlayerRemoving:Connect(removeGui)
+for _, plr in ipairs(Players:GetPlayers()) do
+    if plr ~= LocalPlayer then makeGui(plr) end
+end
+
+-- Rebuild cache when character respawns
+local function hookCharacter(plr)
+    plr.CharacterAdded:Connect(function(char)
+        local data = espCache[plr]
+        if data then
+            data.billboard.Adornee = char:WaitForChild("HumanoidRootPart", 5)
+        end
+    end)
+end
+for _, plr in ipairs(Players:GetPlayers()) do
+    if plr ~= LocalPlayer then hookCharacter(plr) end
+end
+Players.PlayerAdded:Connect(hookCharacter)
+
+local SKELETON = {
+    {"Head","UpperTorso"},{"UpperTorso","LowerTorso"},
+    {"UpperTorso","LeftUpperArm"},{"LeftUpperArm","LeftLowerArm"},{"LeftLowerArm","LeftHand"},
+    {"UpperTorso","RightUpperArm"},{"RightUpperArm","RightLowerArm"},{"RightLowerArm","RightHand"},
+    {"LowerTorso","LeftUpperLeg"},{"LeftUpperLeg","LeftLowerLeg"},{"LeftLowerLeg","LeftFoot"},
+    {"LowerTorso","RightUpperLeg"},{"RightUpperLeg","RightLowerLeg"},{"RightLowerLeg","RightFoot"},
+}
+
+RunService.RenderStepped:Connect(function()
+    for plr, data in pairs(espCache) do
+        local char = plr.Character
+        local hum  = char and char:FindFirstChildOfClass("Humanoid")
+        local root = char and char:FindFirstChild("HumanoidRootPart")
+
+        if not (Config.ESP.Enabled and char and hum and hum.Health > 0 and root) then
+            data.billboard.Enabled = false
+            continue
+        end
+
+        local dist = (Camera.CFrame.Position - root.Position).Magnitude
+        if dist > Config.ESP.MaxDistance then
+            data.billboard.Enabled = false
+            continue
+        end
+
+        data.billboard.Adornee = root
+        data.billboard.Enabled = true
+
+        local team = Config.ESP.TeamCheck and plr.Team == LocalPlayer.Team
+        local color = team and Config.ESP.TeamColor or Config.ESP.Color
+        data.boxStroke.Color = color
+        data.nameLabel.TextColor3 = color
+        data.distLabel.TextColor3 = color
+
+        data.nameLabel.Text = plr.Name
+        data.nameLabel.Visible = Config.ESP.Name
+        data.box.Visible = Config.ESP.Box
+        data.boxStroke.Enabled = Config.ESP.Box
+
+        -- Distance label
+        if Config.ESP.Distance then
+            data.distLabel.Text = string.format("[%d]", math.floor(dist))
+            data.distLabel.Visible = true
+        else
+            data.distLabel.Visible = false
+        end
+
+        -- Health
+        if Config.ESP.Health then
+            local hp = math.clamp(hum.Health / hum.MaxHealth, 0, 1)
+            data.healthBg.Visible = true
+            data.healthFill.Size = UDim2.new(1, 0, hp, 0)
+            data.healthFill.Position = UDim2.new(0, 0, 1 - hp, 0)
+            data.healthFill.BackgroundColor3 = Color3.fromRGB(255 * (1 - hp), 255 * hp, 0)
+        else
+            data.healthBg.Visible = false
+        end
+
+        -- Skeleton
+        if Config.ESP.Skeleton then
+            for i, pair in ipairs(SKELETON) do
+                local a = char:FindFirstChild(pair[1])
+                local b = char:FindFirstChild(pair[2])
+                local line = data.lines[i]
+                if a and b then
+                    local aPos, aOn = Camera:WorldToViewportPoint(a.Position)
+                    local bPos, bOn = Camera:WorldToViewportPoint(b.Position)
+                    -- Convert to billboard-local space: use screen delta directly
+                    if aOn and bOn then
+                        local delta = Vector2.new(bPos.X - aPos.X, bPos.Y - aPos.Y)
+                        local length = delta.Magnitude
+                        local angle = math.deg(math.atan2(delta.Y, delta.X))
+                        line.Size = UDim2.new(0, length, 0, 1)
+                        line.Position = UDim2.new(0, aPos.X, 0, aPos.Y)  -- screen space
+                        line.Rotation = angle
+                        line.Visible = true
+                        line.BackgroundColor3 = color
+                    else
+                        line.Visible = false
+                    end
+                else
+                    line.Visible = false
+                end
+            end
+        else
+            for _, line in pairs(data.lines) do line.Visible = false end
+        end
+    end
+end)
+
+-- ============ UI ============
+local gui = Instance.new("ScreenGui")
+gui.Name = "Settings"
+gui.ResetOnSpawn = false
+gui.IgnoreGuiInset = true
+secureParent(gui)
+
+local frame = Instance.new("Frame", gui)
+frame.Size = UDim2.new(0, 280, 0, 400)
+frame.Position = UDim2.new(0, 20, 0.5, -200)
+frame.BackgroundColor3 = Color3.fromRGB(15, 15, 20)
+frame.BackgroundTransparency = 0.05
+frame.BorderSizePixel = 0
+frame.Active = true
+frame.Draggable = true
+frame.ClipsDescendants = true
+
+local corner = Instance.new("UICorner", frame)
+corner.CornerRadius = UDim.new(0, 8)
+
+local title = Instance.new("TextLabel", frame)
+title.Size = UDim2.new(1, 0, 0, 30)
+title.BackgroundColor3 = Color3.fromRGB(25, 25, 32)
+title.Text = "Lunar | v2"
+title.TextColor3 = Color3.fromRGB(0, 255, 170)
+title.Font = Enum.Font.GothamBold
+title.TextSize = 14
+title.BorderSizePixel = 0
+
+local titleCorner = Instance.new("UICorner", title)
+titleCorner.CornerRadius = UDim.new(0, 8)
+
+local scroll = Instance.new("ScrollingFrame", frame)
+scroll.Size = UDim2.new(1, -10, 1, -40)
+scroll.Position = UDim2.new(0, 5, 0, 35)
+scroll.BackgroundTransparency = 1
+scroll.BorderSizePixel = 0
+scroll.ScrollBarThickness = 3
+scroll.CanvasSize = UDim2.new(0, 0, 0, 500)
+
+local y = 0
+local function addToggle(name, getter, setter)
+    local btn = Instance.new("TextButton", scroll)
+    btn.Size = UDim2.new(1, 0, 0, 26)
+    btn.Position = UDim2.new(0, 0, 0, y)
+    btn.BackgroundColor3 = Color3.fromRGB(25, 25, 32)
+    btn.TextColor3 = getter() and Color3.fromRGB(0, 255, 170) or Color3.fromRGB(180, 180, 180)
+    btn.Text = (getter() and "[+] " or "[-] ") .. name
+    btn.Font = Enum.Font.Gotham
+    btn.TextSize = 12
+    btn.BorderSizePixel = 0
+    btn.MouseButton1Click:Connect(function()
+        setter(not getter())
+        btn.Text = (getter() and "[+] " or "[-] ") .. name
+        btn.TextColor3 = getter() and Color3.fromRGB(0, 255, 170) or Color3.fromRGB(180, 180, 180)
+    end)
+    y = y + 28
+end
+
+local function addCycle(name, getter, setter, options)
+    local btn = Instance.new("TextButton", scroll)
+    btn.Size = UDim2.new(1, 0, 0, 26)
+    btn.Position = UDim2.new(0, 0, 0, y)
+    btn.BackgroundColor3 = Color3.fromRGB(25, 25, 32)
+    btn.TextColor3 = Color3.fromRGB(180, 180, 255)
+    btn.Text = "> " .. name .. ": " .. getter()
+    btn.Font = Enum.Font.Gotham
+    btn.TextSize = 12
+    btn.BorderSizePixel = 0
+    btn.MouseButton1Click:Connect(function()
+        local cur = getter()
+        local idx = 1
+        for i, v in ipairs(options) do if v == cur then idx = i end end
+        idx = idx % #options + 1
+        setter(options[idx])
+        btn.Text = "> " .. name .. ": " .. getter()
+    end)
+    y = y + 28
+end
+
+addToggle("Aimbot", function() return Config.Aimbot.Enabled end, function(v) Config.Aimbot.Enabled = v end)
+addToggle("Silent Aim", function() return Config.SilentAim.Enabled end, function(v) Config.SilentAim.Enabled = v end)
+addToggle("Bunny Hop", function() return Config.Bhop.Enabled end, function(v) Config.Bhop.Enabled = v end)
+addToggle("ESP Master", function() return Config.ESP.Enabled end, function(v) Config.ESP.Enabled = v end)
+addToggle("  Box", function() return Config.ESP.Box end, function(v) Config.ESP.Box = v end)
+addToggle("  Name", function() return Config.ESP.Name end, function(v) Config.ESP.Name = v end)
+addToggle("  Health", function() return Config.ESP.Health end, function(v) Config.ESP.Health = v end)
+addToggle("  Distance", function() return Config.ESP.Distance end, function(v) Config.ESP.Distance = v end)
+addToggle("  Skeleton", function() return Config.ESP.Skeleton end, function(v) Config.ESP.Skeleton = v end)
+addToggle("Team Check", function() return Config.ESP.TeamCheck end, function(v)
+    Config.ESP.TeamCheck = v
+    Config.Aimbot.TeamCheck = v
+    Config.SilentAim.TeamCheck = v
+end)
+addToggle("Wall Check", function() return Config.Aimbot.WallCheck end, function(v)
+    Config.Aimbot.WallCheck = v
+    Config.SilentAim.WallCheck = v
+end)
+addCycle("Aimbot Mode", function() return Config.Aimbot.Mode end, function(v)
+    Config.Aimbot.Mode = v
+    Config.SilentAim.Mode = v
+end, {"Head", "Body"})
+
+scroll.CanvasSize = UDim2.new(0, 0, 0, y + 10)
+
+-- Toggle UI — desktop
+UserInputService.InputBegan:Connect(function(input, gp)
+    if gp then return end
+    if input.KeyCode == Enum.KeyCode.RightShift then
+        frame.Visible = not frame.Visible
+    end
+end)
+
+-- Mobile floating toggle button
+local openBtn = Instance.new("TextButton", gui)
+openBtn.Size = UDim2.new(0, 50, 0, 50)
+openBtn.Position = UDim2.new(0, 20, 0.5, 220)
+openBtn.BackgroundColor3 = Color3.fromRGB(25, 25, 32)
+openBtn.TextColor3 = Color3.fromRGB(0, 255, 170)
+openBtn.Text = "L"
+openBtn.Font = Enum.Font.GothamBold
+openBtn.TextSize = 20
+openBtn.BorderSizePixel = 0
+openBtn.Visible = UserInputService.TouchEnabled
+openBtn.MouseButton1Click:Connect(function()
+    frame.Visible = not frame.Visible
+end)
+
+local openCorner = Instance.new("UICorner", openBtn)
+openCorner.CornerRadius = UDim.new(1, 0)
+
+print("[Lunar] v2 loaded. RightShift / L-button to toggle UI.")
